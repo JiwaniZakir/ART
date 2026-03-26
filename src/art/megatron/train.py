@@ -113,10 +113,7 @@ def _frozen_linear_grad_input(
 ) -> torch.Tensor:
     if grad_output.dim() <= 2 or weight.dim() != 2:
         return grad_output.matmul(weight)
-    try:
-        grad_output_2d = grad_output.view(-1, int(grad_output.shape[-1]))
-    except RuntimeError:
-        grad_output_2d = grad_output.reshape(-1, int(grad_output.shape[-1]))
+    grad_output_2d = grad_output.reshape(-1, int(grad_output.shape[-1]))
     grad_input_2d = grad_output_2d.matmul(weight)
     return grad_input_2d.reshape(*grad_output.shape[:-1], int(weight.shape[-1]))
 
