@@ -121,6 +121,25 @@ def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
     if found and deepep_num_sms is not None:
         provider.moe_deepep_num_sms = deepep_num_sms
 
+    moe_router_dtype_found, moe_router_dtype = _env_optional_str(
+        "ART_MEGATRON_MOE_ROUTER_DTYPE"
+    )
+    if moe_router_dtype_found:
+        provider.moe_router_dtype = cast(object, moe_router_dtype)
+
+    moe_apply_probs_on_input = _env_flag("ART_MEGATRON_MOE_APPLY_PROBS_ON_INPUT")
+    if moe_apply_probs_on_input is not None:
+        provider.moe_apply_probs_on_input = moe_apply_probs_on_input
+
+    moe_permute_fusion = _env_flag("ART_MEGATRON_MOE_PERMUTE_FUSION")
+    if moe_permute_fusion is not None:
+        provider.moe_permute_fusion = moe_permute_fusion
+    elif (
+        getattr(provider, "moe_token_dispatcher_type", None) == "flex"
+        and getattr(provider, "moe_flex_dispatcher_backend", None) == "deepep"
+    ):
+        provider.moe_permute_fusion = False
+
     bias_activation_fusion = _env_flag("ART_MEGATRON_BIAS_ACTIVATION_FUSION")
     if bias_activation_fusion is not None:
         provider.bias_activation_fusion = bias_activation_fusion
