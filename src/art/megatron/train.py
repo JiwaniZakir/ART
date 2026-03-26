@@ -8,7 +8,10 @@ def _set_cache_dir(env_var: str, default_path: str) -> None:
     os.makedirs(os.environ[env_var], exist_ok=True)
 
 
-os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = os.environ.get(
+    "ART_MEGATRON_CUDA_DEVICE_MAX_CONNECTIONS",
+    os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS", "1"),
+)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
 _set_cache_dir("TORCHINDUCTOR_CACHE_DIR", "~/.cache/torchinductor")
@@ -138,6 +141,51 @@ def _install_fast_frozen_output_backward() -> None:
     LinearWithFrozenWeight.backward = staticmethod(_fast_backward)
 
 
+def _install_intranode_deepep_buffer_patch() -> None:
+    from megatron.core.transformer.moe import fused_a2a
+
+    if getattr(fused_a2a.get_buffer, "__art_intranode_deepep_patch__", False):
+        return
+
+    def _safe_rdma_size_hint(config: Any, hidden_bytes: int, group_size: int) -> int:
+        try:
+            return int(config.get_rdma_buffer_size_hint(hidden_bytes, group_size))
+        except RuntimeError as exc:
+            if "NVSHMEM is disable" not in str(exc):
+                raise
+            return 0
+
+    def _patched_get_buffer(
+        group: torch.distributed.ProcessGroup,  # type: ignore[name-defined]
+        hidden_bytes: int,
+    ):
+        num_nvl_bytes, num_rdma_bytes = 0, 0
+        for config in (
+            fused_a2a.Buffer.get_dispatch_config(group.size()),
+            fused_a2a.Buffer.get_combine_config(group.size()),
+        ):
+            num_nvl_bytes = max(
+                int(config.get_nvl_buffer_size_hint(hidden_bytes, group.size())),
+                num_nvl_bytes,
+            )
+            num_rdma_bytes = max(
+                _safe_rdma_size_hint(config, hidden_bytes, group.size()),
+                num_rdma_bytes,
+            )
+
+        if (
+            fused_a2a._buffer is None
+            or fused_a2a._buffer.group != group
+            or fused_a2a._buffer.num_nvl_bytes < num_nvl_bytes
+            or fused_a2a._buffer.num_rdma_bytes < num_rdma_bytes
+        ):
+            fused_a2a._buffer = fused_a2a.Buffer(group, num_nvl_bytes, num_rdma_bytes)
+        return fused_a2a._buffer
+
+    setattr(_patched_get_buffer, "__art_intranode_deepep_patch__", True)
+    fused_a2a.get_buffer = _patched_get_buffer
+
+
 def _install_gpt_preprocess_hook(model_chunks: list[MegatronModule]) -> None:
     for chunk in model_chunks:
         module: Any = chunk
@@ -225,6 +273,7 @@ def build_training_runtime(
     print_optimizer_stats: bool = True,
 ) -> TrainingRuntime:
     _install_fast_frozen_output_backward()
+    _install_intranode_deepep_buffer_patch()
     provider = get_provider(
         model_identifier
         or os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),

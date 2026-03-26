@@ -20,7 +20,12 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from pydantic import BaseModel, ConfigDict
 import torch
 
-from .cute_grouped_lora_quack import quack_grouped_lora, quack_grouped_lora_dual
+from .cute_grouped_lora_quack import (
+    quack_grouped_lora,
+    quack_grouped_lora_dual,
+    quack_grouped_lora_dual_with_base,
+    quack_grouped_lora_with_base,
+)
 
 ShardDomain = Literal["tp", "expert_tp"]
 GradSyncDomain = Literal["tp_default", "expert_tp"]
@@ -649,9 +654,10 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         if isinstance(counts, list):
             counts = torch.tensor(counts, dtype=torch.int64, device="cpu")
         if isinstance(counts, torch.Tensor) and int(torch.count_nonzero(counts)) == 0:
-            adapter_out = x.new_zeros((x.shape[0], self.linear_fc1.out_features))
+            return base_out, bias_out
         else:
-            adapter_out = quack_grouped_lora_dual(
+            output = quack_grouped_lora_dual_with_base(
+                base_out,
                 x,
                 self.gate_lora.A_T,
                 self.gate_lora.B_T,
@@ -661,7 +667,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
                 scale_gate=self.gate_lora.scale,
                 scale_up=self.up_lora.scale,
             )
-        return base_out + adapter_out, bias_out
+        return output, bias_out
 
 
 class MLPExpertsLinearFC2LoRA(torch.nn.Module):
@@ -711,10 +717,22 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         base_out, bias_out = self.linear_fc2(x, tokens_per_expert)
-        adapter_out = self.lora(x, tokens_per_expert=tokens_per_expert)
+        counts = tokens_per_expert
+        if isinstance(counts, list):
+            counts = torch.tensor(counts, dtype=torch.int64, device="cpu")
+        if isinstance(counts, torch.Tensor) and int(torch.count_nonzero(counts)) == 0:
+            return base_out, bias_out
+        output = quack_grouped_lora_with_base(
+            base_out,
+            x,
+            self.lora.A_T,
+            self.lora.B_T,
+            counts,
+            scale=self.lora.scale,
+        )
         # the reason there is no TP comm here is because the MoE token routing handles
         # expert TP comm externally
-        return base_out + adapter_out, bias_out
+        return output, bias_out
 
 
 def apply_lora_adapters(
