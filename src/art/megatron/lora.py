@@ -650,6 +650,8 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         base_out, bias_out = self.linear_fc1(x, tokens_per_expert)
+        if base_out._base is not None:
+            base_out = base_out.clone()
         counts = tokens_per_expert
         if isinstance(counts, list):
             counts = torch.tensor(counts, dtype=torch.int64, device="cpu")
@@ -717,6 +719,8 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         base_out, bias_out = self.linear_fc2(x, tokens_per_expert)
+        if base_out._base is not None:
+            base_out = base_out.clone()
         counts = tokens_per_expert
         if isinstance(counts, list):
             counts = torch.tensor(counts, dtype=torch.int64, device="cpu")
