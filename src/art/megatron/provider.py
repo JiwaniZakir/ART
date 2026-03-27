@@ -165,6 +165,8 @@ def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
     found, deepep_num_sms = _env_optional_int("ART_MEGATRON_MOE_DEEPEP_NUM_SMS")
     if found and deepep_num_sms is not None:
         provider.moe_deepep_num_sms = deepep_num_sms
+    if "ART_MEGATRON_MOE_DEEPEP_NUM_SMS" not in os.environ:
+        provider.moe_deepep_num_sms = _resolve_default_deepep_num_sms(provider)
 
     moe_router_dtype_found, moe_router_dtype = _env_optional_moe_router_dtype(
         "ART_MEGATRON_MOE_ROUTER_DTYPE"
@@ -239,9 +241,6 @@ def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
         provider.recompute_num_layers = None
         if provider.recompute_granularity != "selective":
             provider.recompute_granularity = None
-
-    if "ART_MEGATRON_MOE_DEEPEP_NUM_SMS" not in os.environ:
-        provider.moe_deepep_num_sms = _resolve_default_deepep_num_sms(provider)
 
 
 def get_provider(
