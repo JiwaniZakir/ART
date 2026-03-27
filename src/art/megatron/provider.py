@@ -131,6 +131,16 @@ def _env_optional_recompute_method(
     return True, cast(Literal["uniform", "block"], value)
 
 
+def _resolve_default_deepep_num_sms(provider: GPTModelProvider) -> int:
+    if provider.overlap_moe_expert_parallel_comm:
+        return 20
+    if not torch.cuda.is_available():
+        return 20
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    sm_count -= sm_count % 2
+    return sm_count if sm_count >= 2 else 20
+
+
 def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
     found, flex_backend = _env_optional_str("ART_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND")
     if found and flex_backend is not None:
@@ -229,6 +239,9 @@ def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
         provider.recompute_num_layers = None
         if provider.recompute_granularity != "selective":
             provider.recompute_granularity = None
+
+    if "ART_MEGATRON_MOE_DEEPEP_NUM_SMS" not in os.environ:
+        provider.moe_deepep_num_sms = _resolve_default_deepep_num_sms(provider)
 
 
 def get_provider(
