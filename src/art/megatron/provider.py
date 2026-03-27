@@ -134,11 +134,6 @@ def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
     moe_permute_fusion = _env_flag("ART_MEGATRON_MOE_PERMUTE_FUSION")
     if moe_permute_fusion is not None:
         provider.moe_permute_fusion = moe_permute_fusion
-    elif (
-        getattr(provider, "moe_token_dispatcher_type", None) == "flex"
-        and getattr(provider, "moe_flex_dispatcher_backend", None) == "deepep"
-    ):
-        provider.moe_permute_fusion = False
 
     bias_activation_fusion = _env_flag("ART_MEGATRON_BIAS_ACTIVATION_FUSION")
     if bias_activation_fusion is not None:
@@ -247,6 +242,8 @@ def get_provider(
     provider.expert_model_parallel_size = torch.cuda.device_count()
     provider.expert_tensor_parallel_size = 1
     provider.moe_shared_expert_overlap = True
+    apply_flex_dispatcher_backend(provider, moe_flex_dispatcher_backend="deepep")
+    provider.moe_permute_fusion = False
     provider.moe_router_dtype = "fp32"
     # params are disabled anyways, but should know about this if we switch to full FT
     # because DP 'dummy' microbatches will unintentionally have loss for this

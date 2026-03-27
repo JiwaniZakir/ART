@@ -40,7 +40,6 @@ from art.loss import loss_fn, shift_tensor
 from art.megatron.finalize_grads import finalize_model_grads_extended
 from art.megatron.flex_attention import create_shared_prefix_attention_state
 from art.megatron.lora import apply_lora_adapters
-from art.megatron.moe_unpermute import token_major_unpermute
 from art.megatron.offload import (
     OffloadState,
     clear_optimizer_state,
@@ -187,56 +186,6 @@ def _install_intranode_deepep_buffer_patch() -> None:
     fused_a2a.get_buffer = _patched_get_buffer
 
 
-def _install_token_major_moe_unpermute() -> None:
-    from megatron.core.transformer.moe import moe_utils, token_dispatcher
-
-    if getattr(token_dispatcher.unpermute, "__art_token_major_patch__", False):
-        return
-
-    original_unpermute = moe_utils.unpermute
-
-    def _patched_unpermute(
-        permuted_tokens: torch.Tensor,
-        sorted_indices: torch.Tensor,
-        restore_shape: torch.Size,
-        probs: torch.Tensor | None = None,
-        routing_map: torch.Tensor | None = None,
-        fused: bool = False,
-        drop_and_pad: bool = False,
-        pad_offsets: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        manual_enabled = os.environ.get("ART_MEGATRON_MOE_MANUAL_UNPERMUTE", "0")
-        use_manual = manual_enabled.strip().lower() in {"1", "true", "yes", "on"}
-        if (
-            not use_manual
-            or fused
-            or probs is not None
-            or drop_and_pad
-            or torch.are_deterministic_algorithms_enabled()
-            or sorted_indices.ndim != 1
-            or len(restore_shape) != 2
-        ):
-            return original_unpermute(
-                permuted_tokens,
-                sorted_indices,
-                restore_shape,
-                probs=probs,
-                routing_map=routing_map,
-                fused=fused,
-                drop_and_pad=drop_and_pad,
-                pad_offsets=pad_offsets,
-            )
-        return token_major_unpermute(
-            permuted_tokens,
-            sorted_indices.to(dtype=torch.long),
-            restore_shape,
-        )
-
-    setattr(_patched_unpermute, "__art_token_major_patch__", True)
-    moe_utils.unpermute = _patched_unpermute
-    token_dispatcher.unpermute = _patched_unpermute
-
-
 def _install_gpt_preprocess_hook(model_chunks: list[MegatronModule]) -> None:
     for chunk in model_chunks:
         module: Any = chunk
@@ -325,7 +274,6 @@ def build_training_runtime(
 ) -> TrainingRuntime:
     _install_fast_frozen_output_backward()
     _install_intranode_deepep_buffer_patch()
-    _install_token_major_moe_unpermute()
     provider = get_provider(
         model_identifier
         or os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
