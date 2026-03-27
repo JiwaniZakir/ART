@@ -192,6 +192,43 @@ def _install_intranode_deepep_buffer_patch() -> None:
     fused_a2a_module.get_buffer = _patched_get_buffer
 
 
+def _install_deepep_metadata_release_patch() -> None:
+    from megatron.core.transformer.moe.token_dispatcher import _DeepepManager
+
+    deepep_manager = cast(Any, _DeepepManager)
+    if getattr(deepep_manager, "__art_metadata_release_patch__", False):
+        return
+
+    original_dispatch = deepep_manager.dispatch
+    original_permute = deepep_manager.get_permuted_hidden_states_by_experts
+    original_restore = deepep_manager.get_restored_hidden_states_by_experts
+
+    def _patched_dispatch(self: Any, *args: Any, **kwargs: Any) -> Any:
+        hidden_states = original_dispatch(self, *args, **kwargs)
+        self.token_indices = None
+        self.token_probs = None
+        return hidden_states
+
+    def _patched_permute(self: Any, *args: Any, **kwargs: Any) -> Any:
+        hidden_states, permuted_probs = original_permute(self, *args, **kwargs)
+        self.dispatched_indices = None
+        self.dispatched_probs = None
+        return hidden_states, permuted_probs
+
+    def _patched_restore(self: Any, *args: Any, **kwargs: Any) -> Any:
+        hidden_states = original_restore(self, *args, **kwargs)
+        self.dispatched_routing_map = None
+        self.reversed_mapping_for_combine = None
+        self.pad_offsets = None
+        self.hidden_shape_before_permute = None
+        return hidden_states
+
+    deepep_manager.dispatch = _patched_dispatch
+    deepep_manager.get_permuted_hidden_states_by_experts = _patched_permute
+    deepep_manager.get_restored_hidden_states_by_experts = _patched_restore
+    setattr(deepep_manager, "__art_metadata_release_patch__", True)
+
+
 def _install_gpt_preprocess_hook(model_chunks: list[MegatronModule]) -> None:
     for chunk in model_chunks:
         module: Any = chunk
@@ -280,6 +317,7 @@ def build_training_runtime(
 ) -> TrainingRuntime:
     _install_fast_frozen_output_backward()
     _install_intranode_deepep_buffer_patch()
+    _install_deepep_metadata_release_patch()
     provider = get_provider(
         model_identifier
         or os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
