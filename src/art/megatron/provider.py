@@ -3,7 +3,7 @@ from functools import partial
 import inspect
 import os
 from pathlib import Path
-from typing import Callable, cast
+from typing import Callable, Literal, cast
 
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.gpt_provider import GPTModelProvider
@@ -98,10 +98,45 @@ def _env_optional_str_list(name: str) -> tuple[bool, list[str] | None]:
     return True, [part for part in parts if part]
 
 
+def _env_optional_moe_router_dtype(
+    name: str,
+) -> tuple[bool, Literal["fp32", "fp64"] | None]:
+    found, value = _env_optional_str(name)
+    if not found or value is None:
+        return found, None
+    if value not in {"fp32", "fp64"}:
+        raise ValueError(f"{name} must be one of 'fp32' or 'fp64', got {value!r}")
+    return True, cast(Literal["fp32", "fp64"], value)
+
+
+def _env_optional_recompute_granularity(
+    name: str,
+) -> tuple[bool, Literal["full", "selective"] | None]:
+    found, value = _env_optional_str(name)
+    if not found or value is None:
+        return found, None
+    if value not in {"full", "selective"}:
+        raise ValueError(f"{name} must be one of 'full' or 'selective', got {value!r}")
+    return True, cast(Literal["full", "selective"], value)
+
+
+def _env_optional_recompute_method(
+    name: str,
+) -> tuple[bool, Literal["uniform", "block"] | None]:
+    found, value = _env_optional_str(name)
+    if not found or value is None:
+        return found, None
+    if value not in {"uniform", "block"}:
+        raise ValueError(f"{name} must be one of 'uniform' or 'block', got {value!r}")
+    return True, cast(Literal["uniform", "block"], value)
+
+
 def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
     found, flex_backend = _env_optional_str("ART_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND")
     if found and flex_backend is not None:
-        apply_flex_dispatcher_backend(provider, moe_flex_dispatcher_backend=flex_backend)
+        apply_flex_dispatcher_backend(
+            provider, moe_flex_dispatcher_backend=flex_backend
+        )
 
     overlap = _env_flag("ART_MEGATRON_OVERLAP_MOE_EXPERT_PARALLEL_COMM")
     if overlap is not None:
@@ -121,11 +156,11 @@ def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
     if found and deepep_num_sms is not None:
         provider.moe_deepep_num_sms = deepep_num_sms
 
-    moe_router_dtype_found, moe_router_dtype = _env_optional_str(
+    moe_router_dtype_found, moe_router_dtype = _env_optional_moe_router_dtype(
         "ART_MEGATRON_MOE_ROUTER_DTYPE"
     )
     if moe_router_dtype_found:
-        provider.moe_router_dtype = cast(object, moe_router_dtype)
+        provider.moe_router_dtype = moe_router_dtype
 
     moe_apply_probs_on_input = _env_flag("ART_MEGATRON_MOE_APPLY_PROBS_ON_INPUT")
     if moe_apply_probs_on_input is not None:
@@ -157,17 +192,17 @@ def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
     if found and tensor_model_parallel_size is not None:
         provider.tensor_model_parallel_size = tensor_model_parallel_size
 
-    recompute_granularity_found, recompute_granularity = _env_optional_str(
-        "ART_MEGATRON_RECOMPUTE_GRANULARITY"
+    recompute_granularity_found, recompute_granularity = (
+        _env_optional_recompute_granularity("ART_MEGATRON_RECOMPUTE_GRANULARITY")
     )
     if recompute_granularity_found:
-        provider.recompute_granularity = cast(object, recompute_granularity)
+        provider.recompute_granularity = recompute_granularity
 
-    recompute_method_found, recompute_method = _env_optional_str(
+    recompute_method_found, recompute_method = _env_optional_recompute_method(
         "ART_MEGATRON_RECOMPUTE_METHOD"
     )
     if recompute_method_found:
-        provider.recompute_method = cast(object, recompute_method)
+        provider.recompute_method = recompute_method
 
     recompute_num_layers_found, recompute_num_layers = _env_optional_int(
         "ART_MEGATRON_RECOMPUTE_NUM_LAYERS"
@@ -242,6 +277,8 @@ def get_provider(
     provider.expert_model_parallel_size = torch.cuda.device_count()
     provider.expert_tensor_parallel_size = 1
     provider.moe_shared_expert_overlap = True
+    # use DeepEP for MoE expert comm. comm can be the same amount of time as actual MLP compute,
+    # so these are very beneficial
     apply_flex_dispatcher_backend(provider, moe_flex_dispatcher_backend="deepep")
     provider.moe_permute_fusion = False
     provider.moe_router_dtype = "fp32"

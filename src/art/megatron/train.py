@@ -134,7 +134,7 @@ def _install_fast_frozen_output_backward() -> None:
         (weight,) = ctx.saved_tensors
         grad_input = _frozen_linear_grad_input(grad_output, weight)
         if ctx.allreduce_dgrad:
-            torch.distributed.all_reduce(grad_input, group=ctx.tp_group)
+            cast(Any, torch.distributed).all_reduce(grad_input, group=ctx.tp_group)
         return grad_input, None, None, None, None
 
     setattr(_fast_backward, "__art_fast_output_backward__", True)
@@ -142,9 +142,13 @@ def _install_fast_frozen_output_backward() -> None:
 
 
 def _install_intranode_deepep_buffer_patch() -> None:
+    # currently needed because we don't build DeepEP with nvshmem, needed for inter-node comm
+    # when we upgrade to multi-node, we'll build with nvshmem, remove this patch and validate the performance
     from megatron.core.transformer.moe import fused_a2a
 
-    if getattr(fused_a2a.get_buffer, "__art_intranode_deepep_patch__", False):
+    fused_a2a_module = cast(Any, fused_a2a)
+
+    if getattr(fused_a2a_module.get_buffer, "__art_intranode_deepep_patch__", False):
         return
 
     def _safe_rdma_size_hint(config: Any, hidden_bytes: int, group_size: int) -> int:
@@ -158,11 +162,11 @@ def _install_intranode_deepep_buffer_patch() -> None:
     def _patched_get_buffer(
         group: torch.distributed.ProcessGroup,  # type: ignore[name-defined]
         hidden_bytes: int,
-    ):
+    ) -> Any:
         num_nvl_bytes, num_rdma_bytes = 0, 0
         for config in (
-            fused_a2a.Buffer.get_dispatch_config(group.size()),
-            fused_a2a.Buffer.get_combine_config(group.size()),
+            fused_a2a_module.Buffer.get_dispatch_config(group.size()),
+            fused_a2a_module.Buffer.get_combine_config(group.size()),
         ):
             num_nvl_bytes = max(
                 int(config.get_nvl_buffer_size_hint(hidden_bytes, group.size())),
@@ -173,17 +177,19 @@ def _install_intranode_deepep_buffer_patch() -> None:
                 num_rdma_bytes,
             )
 
+        buffer = fused_a2a_module._buffer
         if (
-            fused_a2a._buffer is None
-            or fused_a2a._buffer.group != group
-            or fused_a2a._buffer.num_nvl_bytes < num_nvl_bytes
-            or fused_a2a._buffer.num_rdma_bytes < num_rdma_bytes
+            buffer is None
+            or buffer.group != group
+            or buffer.num_nvl_bytes < num_nvl_bytes
+            or buffer.num_rdma_bytes < num_rdma_bytes
         ):
-            fused_a2a._buffer = fused_a2a.Buffer(group, num_nvl_bytes, num_rdma_bytes)
-        return fused_a2a._buffer
+            buffer = fused_a2a_module.Buffer(group, num_nvl_bytes, num_rdma_bytes)
+            fused_a2a_module._buffer = buffer
+        return buffer
 
     setattr(_patched_get_buffer, "__art_intranode_deepep_patch__", True)
-    fused_a2a.get_buffer = _patched_get_buffer
+    fused_a2a_module.get_buffer = _patched_get_buffer
 
 
 def _install_gpt_preprocess_hook(model_chunks: list[MegatronModule]) -> None:
