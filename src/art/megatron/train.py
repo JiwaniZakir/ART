@@ -92,7 +92,6 @@ class TrainStepResult(BaseModel):
 
     reduced_loss: torch.Tensor
     probs_corr: float
-    new_logprobs: torch.Tensor
     update_successful: bool
     grad_norm: float
     num_zeros_in_grad: int | None
@@ -227,6 +226,18 @@ def _install_deepep_metadata_release_patch() -> None:
     deepep_manager.get_permuted_hidden_states_by_experts = _patched_permute
     deepep_manager.get_restored_hidden_states_by_experts = _patched_restore
     setattr(deepep_manager, "__art_metadata_release_patch__", True)
+
+
+def _eager_initialize_optimizer_state(optimizer: Any) -> None:
+    chained_optimizers = getattr(optimizer, "chained_optimizers", None)
+    if chained_optimizers is not None:
+        for child_optimizer in chained_optimizers:
+            _eager_initialize_optimizer_state(child_optimizer)
+        return
+    init_state_fn = getattr(optimizer, "init_state_fn", None)
+    inner_optimizer = getattr(optimizer, "optimizer", None)
+    if callable(init_state_fn) and inner_optimizer is not None:
+        init_state_fn(inner_optimizer, getattr(optimizer, "config", None))
 
 
 def _install_gpt_preprocess_hook(model_chunks: list[MegatronModule]) -> None:
@@ -609,7 +620,6 @@ def run_training_step(
     raw_loss_sum: torch.Tensor | None = None
     num_tokens = _local_trainable_token_count_tensor(micro_inputs, device=device)
     probs_corr_sum = 0.0
-    new_logprobs: torch.Tensor | None = None
 
     for micro in micro_inputs:
         _move_inputs_to_device(micro, device)
@@ -643,10 +653,16 @@ def run_training_step(
             raw_loss_sum = detached_micro_loss
         else:
             raw_loss_sum = raw_loss_sum + detached_micro_loss
+        del loss_info
+        del micro_loss
+        del attention_mask
+        del attention_state
+        del new_logprobs
 
-    if new_logprobs is None or raw_loss_sum is None:
+    if raw_loss_sum is None:
         raise RuntimeError("run_training_step did not produce outputs")
 
+    torch.cuda.empty_cache()
     finalize_model_grads_extended(model_chunks, num_tokens=num_tokens)
     update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
         optimizer,
@@ -665,7 +681,6 @@ def run_training_step(
     return TrainStepResult(
         reduced_loss=reduced_loss,
         probs_corr=probs_corr_sum / micro_count,
-        new_logprobs=new_logprobs,
         update_successful=update_successful,
         grad_norm=grad_norm,
         num_zeros_in_grad=num_zeros_in_grad,
@@ -731,6 +746,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
             )
             clear_optimizer_state(runtime.optimizer)
             runtime.optimizer.reload_model_params()
+            _eager_initialize_optimizer_state(runtime.optimizer)
 
         print0(
             runtime.rank, "Loading packed tensors from", job.disk_packed_tensors["dir"]
