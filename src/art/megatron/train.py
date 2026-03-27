@@ -832,7 +832,6 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         if "micro_inputs" in locals():
             del micro_inputs
         gc.collect()
-        torch.cuda.empty_cache()
 
         torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
         if runtime.rank == 0:
