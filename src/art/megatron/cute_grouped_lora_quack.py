@@ -137,10 +137,6 @@ def _validate_dual_inputs(
     return counts
 
 
-def _counts_are_empty(counts: torch.Tensor) -> bool:
-    return int(torch.count_nonzero(counts)) == 0
-
-
 def _effective_rank(rank: int) -> int:
     if rank < _PADDED_LOW_RANK_TARGET:
         return _PADDED_LOW_RANK_TARGET
@@ -590,8 +586,6 @@ def quack_grouped_lora(
     synchronization in the hot path.
     """
     counts_tensor = _validate_inputs(x, a_t, b_t, counts)
-    if _counts_are_empty(counts_tensor):
-        return x.new_zeros((x.shape[0], b_t.shape[-1]))
     return _QuackGroupedLoraFn.apply(x, a_t, b_t, counts_tensor, scale)
 
 
@@ -609,8 +603,6 @@ def quack_grouped_lora_dual(
 ) -> torch.Tensor:
     """Run grouped FC1 gate/up LoRA with a shared QuACK projection path."""
     counts_tensor = _validate_dual_inputs(x, gate_a_t, gate_b_t, up_a_t, up_b_t, counts)
-    if _counts_are_empty(counts_tensor):
-        return x.new_zeros((x.shape[0], gate_b_t.shape[-1] + up_b_t.shape[-1]))
     return _QuackGroupedLoraDualFn.apply(
         x,
         gate_a_t,

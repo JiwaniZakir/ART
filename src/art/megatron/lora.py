@@ -361,13 +361,13 @@ class LoRA(torch.nn.Module):
             assert self.num_local_experts > 1, (
                 "tokens_per_expert is only supported if num_local_experts > 1"
             )
-            return quack_grouped_lora(
-                x,
-                self.A_T,
-                self.B_T,
-                tokens_per_expert,
-                scale=self.scale,
-            )
+            bsz = tokens_per_expert
+            if isinstance(bsz, list):
+                bsz = torch.tensor(bsz, dtype=torch.int64, device="cpu")
+            # If no tokens routed locally, return zeros.
+            if isinstance(bsz, torch.Tensor) and int(torch.count_nonzero(bsz)) == 0:
+                return x.new_zeros((x.shape[0], self.B_T.shape[-1]))
+            return quack_grouped_lora(x, self.A_T, self.B_T, bsz, scale=self.scale)
         out = (x @ self.A_T) @ self.B_T
         if self.scale == 1.0:
             return out
@@ -645,16 +645,22 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         base_out, bias_out = self.linear_fc1(x, tokens_per_expert)
-        adapter_out = quack_grouped_lora_dual(
-            x,
-            self.gate_lora.A_T,
-            self.gate_lora.B_T,
-            self.up_lora.A_T,
-            self.up_lora.B_T,
-            tokens_per_expert,
-            scale_gate=self.gate_lora.scale,
-            scale_up=self.up_lora.scale,
-        )
+        counts = tokens_per_expert
+        if isinstance(counts, list):
+            counts = torch.tensor(counts, dtype=torch.int64, device="cpu")
+        if isinstance(counts, torch.Tensor) and int(torch.count_nonzero(counts)) == 0:
+            adapter_out = x.new_zeros((x.shape[0], self.linear_fc1.out_features))
+        else:
+            adapter_out = quack_grouped_lora_dual(
+                x,
+                self.gate_lora.A_T,
+                self.gate_lora.B_T,
+                self.up_lora.A_T,
+                self.up_lora.B_T,
+                counts,
+                scale_gate=self.gate_lora.scale,
+                scale_up=self.up_lora.scale,
+            )
         return base_out + adapter_out, bias_out
 
 
