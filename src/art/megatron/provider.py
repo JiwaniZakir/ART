@@ -178,10 +178,6 @@ def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
     if moe_apply_probs_on_input is not None:
         provider.moe_apply_probs_on_input = moe_apply_probs_on_input
 
-    moe_permute_fusion = _env_flag("ART_MEGATRON_MOE_PERMUTE_FUSION")
-    if moe_permute_fusion is not None:
-        provider.moe_permute_fusion = moe_permute_fusion
-
     bias_activation_fusion = _env_flag("ART_MEGATRON_BIAS_ACTIVATION_FUSION")
     if bias_activation_fusion is not None:
         provider.bias_activation_fusion = bias_activation_fusion
@@ -292,7 +288,7 @@ def get_provider(
     # use DeepEP for MoE expert comm. comm can be the same amount of time as actual MLP compute,
     # so these are very beneficial
     apply_flex_dispatcher_backend(provider, moe_flex_dispatcher_backend="deepep")
-    provider.moe_permute_fusion = False
+    provider.moe_permute_fusion = True
     provider.moe_router_dtype = "fp32"
     # params are disabled anyways, but should know about this if we switch to full FT
     # because DP 'dummy' microbatches will unintentionally have loss for this
