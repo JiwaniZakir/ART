@@ -30,16 +30,24 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer.module import MegatronModule
-from pydantic import BaseModel, ConfigDict
+from megatron.core.transformer.transformer_layer import TransformerLayer
+from pydantic import BaseModel, ConfigDict, field_validator
 from safetensors.torch import load_file, save_file
 import torch
 from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_dir
 
 from art import dev, types
 from art.loss import loss_fn, shift_tensor
+from art.megatron.compile_workarounds import install_torch_compile_workarounds
 from art.megatron.finalize_grads import finalize_model_grads_extended
 from art.megatron.flex_attention import create_shared_prefix_attention_state
 from art.megatron.lora import apply_lora_adapters
+from art.megatron.model_chunks import (
+    ModelChunks,
+    as_megatron_api_chunks,
+    unwrap_megatron_chunk,
+    validate_model_chunks,
+)
 from art.megatron.offload import (
     OffloadState,
     clear_optimizer_state,
@@ -80,11 +88,17 @@ class TrainingRuntime(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     provider: Any
-    model: list[MegatronModule]
+    model: ModelChunks
     optimizer: Any
     rank: int
     world_size: int
     moe_routing_replay_controller: MoeRoutingReplayController | None = None
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model(cls, value: ModelChunks) -> ModelChunks:
+        validate_model_chunks(value)
+        return value
 
 
 class TrainStepResult(BaseModel):
@@ -240,9 +254,9 @@ def _eager_initialize_optimizer_state(optimizer: Any) -> None:
         init_state_fn(inner_optimizer, getattr(optimizer, "config", None))
 
 
-def _install_gpt_preprocess_hook(model_chunks: list[MegatronModule]) -> None:
+def _install_gpt_preprocess_hook(model_chunks: ModelChunks) -> None:
     for chunk in model_chunks:
-        module: Any = chunk
+        module: Any = unwrap_megatron_chunk(chunk)
         while not isinstance(module, GPTModel) and hasattr(module, "module"):
             module = module.module
         if not isinstance(module, GPTModel):
@@ -342,7 +356,7 @@ def build_training_runtime(
     )
 
     model = cast(
-        list[MegatronModule],
+        ModelChunks,
         provider.provide_distributed_model(
             ddp_config=DistributedDataParallelConfig(
                 # memory and comm for this should be small anyways cause lora
@@ -366,10 +380,13 @@ def build_training_runtime(
         print("TRITON_CACHE_DIR:", os.environ["TRITON_CACHE_DIR"])
 
     _install_gpt_preprocess_hook(model)
+    install_torch_compile_workarounds()
+    for chunk in model:
+        _compile_transformer_layers(chunk)
 
     optimizer = get_megatron_optimizer(
         config=optimizer_config or _default_optimizer_config(),
-        model_chunks=model,
+        model_chunks=as_megatron_api_chunks(model),
     )
 
     if rank == 0 and print_optimizer_stats:
@@ -400,14 +417,34 @@ def build_training_runtime(
     return runtime
 
 
-def iter_modules(model_chunks: list[MegatronModule]) -> Any:
+def _set_child_module(
+    parent: torch.nn.Module,
+    name: str,
+    child: torch.nn.Module,
+) -> None:
+    if isinstance(parent, torch.nn.ModuleList | torch.nn.Sequential):
+        parent[int(name)] = child
+        return
+    setattr(parent, name, child)
+
+
+def _compile_transformer_layers(module: torch.nn.Module) -> None:
+    for name, child in list(module.named_children()):
+        if isinstance(child, TransformerLayer):
+            compiled_child = cast(torch.nn.Module, torch.compile(child))
+            _set_child_module(parent=module, name=name, child=compiled_child)
+            continue
+        _compile_transformer_layers(child)
+
+
+def iter_modules(model_chunks: ModelChunks) -> Any:
     for chunk in model_chunks:
         for module in chunk.modules():
             yield module
 
 
 def load_adapter_into_model(
-    model_chunks: list[MegatronModule],
+    model_chunks: ModelChunks,
     adapter_model: dict[str, torch.Tensor],
     optimizer: Any | None = None,
 ) -> None:
@@ -422,7 +459,7 @@ def load_adapter_into_model(
 
 
 def collect_sharded_lora_state(
-    model_chunks: list[MegatronModule],
+    model_chunks: ModelChunks,
     adapter_model: dict[str, torch.Tensor],
 ) -> tuple[dict[str, torch.Tensor], dict[str, dict[str, Any]]]:
     sharded_state_dict: dict[str, torch.Tensor] = {}
@@ -578,7 +615,7 @@ def _local_trainable_token_count_tensor(
 
 def run_training_step(
     *,
-    model_chunks: list[MegatronModule],
+    model_chunks: ModelChunks,
     optimizer: Any,
     learning_rate: float,
     inputs: PackedTensors | list[PackedTensors],
@@ -663,7 +700,10 @@ def run_training_step(
         raise RuntimeError("run_training_step did not produce outputs")
 
     torch.cuda.empty_cache()
-    finalize_model_grads_extended(model_chunks, num_tokens=num_tokens)
+    finalize_model_grads_extended(
+        as_megatron_api_chunks(model_chunks),
+        num_tokens=num_tokens,
+    )
     update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
         optimizer,
         learning_rate,
