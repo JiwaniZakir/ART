@@ -63,7 +63,30 @@ class FlexAttentionWrapper(torch.nn.Module):
         )
 
 
-_compiled_create_block_mask = torch.compile(create_block_mask)
+@torch.compile
+def _build_shared_prefix_block_mask(
+    group_ids: Tensor,
+    parent_ids: Tensor,
+) -> BlockMask:
+    def _shared_prefix_mask(
+        batch_idx: Tensor,
+        head_idx: Tensor,
+        query_idx: Tensor,
+        kv_idx: Tensor,
+    ) -> Tensor:
+        del head_idx
+        same_group = group_ids[batch_idx, query_idx] == group_ids[batch_idx, kv_idx]
+        parent_prefix = parent_ids[batch_idx, query_idx] == group_ids[batch_idx, kv_idx]
+        return (query_idx >= kv_idx) & (same_group | parent_prefix)
+
+    return create_block_mask(
+        _shared_prefix_mask,
+        group_ids.shape[0],
+        None,
+        group_ids.shape[1],
+        group_ids.shape[1],
+        device=group_ids.device,
+    )
 
 
 def create_shared_prefix_attention_state(
@@ -79,28 +102,7 @@ def create_shared_prefix_attention_state(
         parent_ids: `[B, S]` parent group id for each token in a packed sequence.
     """
 
-    def _shared_prefix_mask(
-        batch_idx: Tensor,
-        head_idx: Tensor,
-        query_idx: Tensor,
-        kv_idx: Tensor,
-    ) -> Tensor:
-        del head_idx
-        # Token q can attend token k if k is causal and either from the same
-        # traj (traj -> traj)/within the shared prefix (prefix -> prefix) (same_group)
-        # or from the prefix which q uses (traj -> prefix) (parent_prefix).
-        same_group = group_ids[batch_idx, query_idx] == group_ids[batch_idx, kv_idx]
-        parent_prefix = parent_ids[batch_idx, query_idx] == group_ids[batch_idx, kv_idx]
-        return (query_idx >= kv_idx) & (same_group | parent_prefix)
-
-    block_mask = _compiled_create_block_mask(
-        _shared_prefix_mask,
-        group_ids.shape[0],
-        None,
-        group_ids.shape[1],
-        group_ids.shape[1],
-        device=group_ids.device,
-    )
+    block_mask = _build_shared_prefix_block_mask(group_ids, parent_ids)
     return SharedPrefixAttentionState(block_mask=block_mask)
 
 
