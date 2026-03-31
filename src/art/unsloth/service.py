@@ -6,7 +6,6 @@ from functools import cached_property
 import json
 import logging
 import os
-import socket
 import subprocess
 import sys
 from typing import TYPE_CHECKING, Any, AsyncIterator, Literal, Protocol, cast
@@ -34,6 +33,7 @@ from ..preprocessing.pack import (
 from ..preprocessing.tokenize import SFTBatch
 from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
+from ..utils.network import find_free_tcp_port
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
 from .train import StopTrainingLoop, gc_and_empty_cuda_cache, train
@@ -208,12 +208,6 @@ def _get_trainer_optimizer(trainer: GRPOTrainer) -> Optimizer:
     return optimizer
 
 
-def _find_free_tcp_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return cast(int, sock.getsockname()[1])
-
-
 def _normalize_merged_checkpoint_name(name: str) -> str:
     # PEFT wraps adapted modules under `.base_layer`, but vLLM expects the
     # original checkpoint parameter names during update_weights().
@@ -221,6 +215,9 @@ def _normalize_merged_checkpoint_name(name: str) -> str:
     while ".base_layer." in normalized:
         normalized = normalized.replace(".base_layer.", ".")
     return normalized
+
+
+_find_free_tcp_port = find_free_tcp_port
 
 
 # ============================================================================
@@ -523,7 +520,7 @@ class UnslothService:
                 ) from exc
             inference_world_size = int(world_size_response.json()["world_size"])
 
-            master_port = _find_free_tcp_port()
+            master_port = find_free_tcp_port()
             init_info = {
                 "master_address": "127.0.0.1",
                 "master_port": master_port,
