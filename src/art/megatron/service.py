@@ -29,6 +29,7 @@ from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm import get_llm, openai_server_task, run_on_workers
+from .lora import LORA_ALPHA, LORA_RANK
 from .routing_replay import MoeRoutingReplayBundle
 
 
@@ -73,11 +74,10 @@ class MegatronService:
         return self._optimizer_state_path
 
     def _default_lora_adapter_config(self) -> LoraConfig:
-        # Keep in sync with LoRA settings in megatron/train.py.
         return LoraConfig(
             base_model_name_or_path=self.base_model,
-            r=1,
-            lora_alpha=32,
+            r=LORA_RANK,
+            lora_alpha=LORA_ALPHA,
             target_modules=default_target_modules(self.base_model),
             bias="none",
         )
