@@ -8,12 +8,12 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 from typing import Any, AsyncIterator, Literal
 
 from peft.tuners.lora.config import LoraConfig
-from pydantic import BaseModel
 from safetensors import safe_open
 from safetensors.torch import save_file
 import torch
@@ -30,27 +30,18 @@ from ..preprocessing.tokenize import SFTBatch
 from ..unsloth.service import do_sleep, do_wake_up, gc_and_empty_cuda_cache
 from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
+from ..utils.network import find_free_tcp_port
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm import get_llm, openai_server_task, run_on_workers
-from .routing_replay import MoeRoutingReplayBundle
-
-
-class MegatronTrainingJob(BaseModel):
-    """Job format for communication with train.py"""
-
-    lora_path: str
-    optimizer_state_path: str
-    disk_packed_tensors: DiskPackedTensors
-    config: types.TrainConfig
-    experimental_config: dev.TrainConfig
-    moe_routing_replay_path: str | None = None
-    moe_routing_replay_strict: bool = True
-
-
-MegatronTrainingJob.model_rebuild(
-    force=True, _types_namespace={"MoeRoutingReplayBundle": MoeRoutingReplayBundle}
+from .job_protocol import (
+    MegatronJob,
+    MegatronLoraTrainJob,
+    MegatronMergedTrainJob,
+    MegatronSyncJob,
+    MergedWeightTransferInitInfo,
+    MergedWeightTransferSpec,
+    dump_megatron_job,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +61,10 @@ class MegatronService:
     _vllm_log_file: Any = field(default=None, repr=False)
     _vllm_host: str = "127.0.0.1"
     _vllm_port: int = 0
+    _merged_weight_transfer_init_info: MergedWeightTransferInitInfo | None = field(
+        default=None,
+        repr=False,
+    )
 
     @property
     def is_dedicated(self) -> bool:
@@ -110,14 +105,11 @@ class MegatronService:
         adapter_path = os.path.join(lora_path, "adapter_model.safetensors")
         if not os.path.exists(adapter_path):
             return False
-        try:
-            with safe_open(adapter_path, framework="pt") as adapter_file:
-                for key in adapter_file.keys():
-                    tensor = adapter_file.get_tensor(key)
-                    if torch.any(tensor != 0):
-                        return True
-        except Exception:
-            return False
+        with safe_open(adapter_path, framework="pt") as adapter_file:
+            for key in adapter_file.keys():
+                tensor = adapter_file.get_tensor(key)
+                if torch.any(tensor != 0):
+                    return True
         return False
 
     def _create_identity_lora(self, lora_path: str) -> None:
@@ -181,19 +173,21 @@ class MegatronService:
             return
         self._create_identity_lora(lora_path)
 
-    def _ensure_lora_adapter_config(
-        self, lora_path: str, *, source_path: str | None = None
-    ) -> None:
+    def _ensure_lora_adapter_config(self, lora_path: str) -> None:
         config_path = os.path.join(lora_path, "adapter_config.json")
         if os.path.exists(config_path):
             return
         os.makedirs(lora_path, exist_ok=True)
-        if source_path is not None:
-            source_config = os.path.join(source_path, "adapter_config.json")
-            if os.path.exists(source_config):
-                shutil.copy(source_config, config_path)
-                return
         self._default_lora_adapter_config().save_pretrained(lora_path)
+
+    def _build_merged_weight_transfer_spec(self, step: int) -> MergedWeightTransferSpec:
+        init_info = self._merged_weight_transfer_init_info
+        assert init_info is not None
+        return MergedWeightTransferSpec(
+            init_info=init_info,
+            vllm_base_url=self._vllm_base_url,
+            served_model_name=f"{self.model_name}@{step}",
+        )
 
     def _resolve_active_lora_path(self) -> str:
         lora_path = get_last_checkpoint_dir(self.output_dir)
@@ -202,9 +196,42 @@ class MegatronService:
             self._latest_step = 0
         else:
             self._latest_step = get_step_from_dir(self.output_dir)
-        self._ensure_identity_lora(lora_path)
+        if self.rollout_weights_mode == "lora":
+            self._ensure_identity_lora(lora_path)
         self._ensure_lora_adapter_config(lora_path)
         return lora_path
+
+    async def _set_served_model_name(self, step: int) -> None:
+        import httpx
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/art/set_served_model_name",
+                json={"name": f"{self.model_name}@{step}"},
+                timeout=30.0,
+            )
+            response.raise_for_status()
+        self._latest_step = step
+
+    async def _init_merged_weight_transfer(self) -> None:
+        import httpx
+
+        if self._merged_weight_transfer_init_info is not None:
+            return
+        assert len(self.config["trainer_gpu_ids"]) == 1
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self._vllm_base_url}/get_world_size",
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            inference_world_size = int(response.json()["world_size"])
+        self._merged_weight_transfer_init_info = MergedWeightTransferInitInfo(
+            master_address="127.0.0.1",
+            master_port=find_free_tcp_port(),
+            rank_offset=1,
+            world_size=inference_world_size + 1,
+        )
 
     async def _start_vllm_subprocess(
         self,
@@ -213,6 +240,7 @@ class MegatronService:
         config: dev.OpenAIServerConfig | None,
     ) -> tuple[str, int]:
         import atexit
+
         import httpx
 
         inference_gpu_ids = self.config["inference_gpu_ids"]
@@ -232,8 +260,13 @@ class MegatronService:
         if config and "engine_args" in config:
             engine_args.update(dict(config["engine_args"]))
         engine_args.setdefault("generation_config", "vllm")
-        engine_args["enable_lora"] = True
-        engine_args.setdefault("max_loras", 2)
+        if self.rollout_weights_mode == "merged":
+            engine_args["weight_transfer_config"] = {"backend": "nccl"}
+            engine_args.pop("enable_lora", None)
+            engine_args.pop("max_loras", None)
+        else:
+            engine_args["enable_lora"] = True
+            engine_args.setdefault("max_loras", 2)
         for key in ("model", "served_model_name", "enable_sleep_mode"):
             engine_args.pop(key, None)
 
@@ -313,6 +346,77 @@ class MegatronService:
             response.raise_for_status()
         self._latest_step = step
 
+    async def _sync_dedicated_merged_weights(
+        self,
+        *,
+        lora_path: str,
+        step: int,
+    ) -> None:
+        await self._ensure_megatron_running()
+        await self._init_merged_weight_transfer()
+        job_path = self._write_job(
+            MegatronSyncJob(
+                kind="sync",
+                lora_path=lora_path,
+                merged_weight_transfer=self._build_merged_weight_transfer_spec(step),
+            )
+        )
+        async for _ in self._stream_training_log(
+            job_path=job_path, lora_path=lora_path
+        ):
+            pass
+        self._latest_step = step
+
+    def _write_job(self, job: MegatronJob) -> str:
+        jobs_dir = "/tmp/megatron_training_jobs"
+        os.makedirs(jobs_dir, exist_ok=True)
+        for job_name in os.listdir(jobs_dir):
+            if job_name.endswith(".json"):
+                os.remove(os.path.join(jobs_dir, job_name))
+        log_path = "/tmp/megatron_training_log.jsonl"
+        if os.path.exists(log_path):
+            os.remove(log_path)
+        if (
+            job.kind != "sync"
+            and job.experimental_config.get("moe_routing_replay_bundle") is not None
+        ):
+            raise RuntimeError(
+                "moe_routing_replay_bundle is only supported for in-process/runtime APIs; "
+                "MegatronService subprocess jobs must use moe_routing_replay_path."
+            )
+        job_path = os.path.join(jobs_dir, f"{datetime.datetime.now().isoformat()}.json")
+        with open(job_path, "w", encoding="utf-8") as handle:
+            handle.write(dump_megatron_job(job))
+        return job_path
+
+    async def _stream_training_log(
+        self,
+        *,
+        job_path: str,
+        lora_path: str,
+    ) -> AsyncIterator[dict[str, float]]:
+        log_path = "/tmp/megatron_training_log.jsonl"
+        num_lines = 0
+        while True:
+            await asyncio.sleep(0.1)
+            if not os.path.exists(log_path):
+                assert os.path.exists(job_path)
+                continue
+            with open(log_path, "a+", encoding="utf-8") as log_file:
+                log_file.seek(0)
+                lines = log_file.readlines()[num_lines:]
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                if line == "all done":
+                    self._merge_lora_adapter(lora_path)
+                    os.remove(log_path)
+                    return
+                num_lines += 1
+                yield json.loads(line)
+            assert os.path.exists(job_path)
+
     def _stop_vllm_subprocess(self) -> None:
         if self._vllm_process is not None:
             self._vllm_process.terminate()
@@ -325,12 +429,13 @@ class MegatronService:
         if self._vllm_log_file is not None:
             self._vllm_log_file.close()
             self._vllm_log_file = None
+        self._merged_weight_transfer_init_info = None
 
     def _stop_megatron_process(self) -> None:
         if self._megatron_process is None:
             return
         if self._megatron_process.returncode is None:
-            self._megatron_process.terminate()
+            os.killpg(os.getpgid(self._megatron_process.pid), signal.SIGTERM)
         self._megatron_process = None
 
     async def _add_lora_aliases(
@@ -349,8 +454,10 @@ class MegatronService:
 
     async def register_lora_for_step(self, step: int, checkpoint_dir: str) -> None:
         if self.is_dedicated:
-            assert self.rollout_weights_mode == "lora"
-            await self._reload_adapter(checkpoint_dir, step)
+            if self.rollout_weights_mode == "merged":
+                await self._set_served_model_name(step)
+            else:
+                await self._reload_adapter(checkpoint_dir, step)
             return
         llm = await self.llm
         await llm.pause_generation()
@@ -394,6 +501,7 @@ class MegatronService:
             command,
             cwd=str(project_root),
             env=launch_env,
+            start_new_session=True,
         )
 
     async def start_openai_server(
@@ -402,9 +510,14 @@ class MegatronService:
         lora_path = self._resolve_active_lora_path()
 
         if self.is_dedicated:
-            assert self.rollout_weights_mode == "lora"
             port = (config or {}).get("server_args", {}).get("port", 8000)
-            return await self._start_vllm_subprocess(lora_path, port, config)
+            location = await self._start_vllm_subprocess(lora_path, port, config)
+            if self.rollout_weights_mode == "merged":
+                await self._sync_dedicated_merged_weights(
+                    lora_path=lora_path,
+                    step=self._latest_step,
+                )
+            return location
 
         lora_path_for_server = (
             lora_path if self._adapter_has_weights(lora_path) else None
@@ -442,73 +555,61 @@ class MegatronService:
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         if self.is_dedicated:
-            assert self.rollout_weights_mode == "lora"
             await self._ensure_megatron_running()
 
             lora_path = self._resolve_active_lora_path()
             self._optimizer_state_path = self._get_optimizer_state_path()
-
-            jobs_dir = "/tmp/megatron_training_jobs"
-            os.makedirs(jobs_dir, exist_ok=True)
-            for job_name in os.listdir(jobs_dir):
-                if job_name.endswith(".json"):
-                    os.remove(os.path.join(jobs_dir, job_name))
-            if _config.get("moe_routing_replay_bundle") is not None:
-                raise RuntimeError(
-                    "moe_routing_replay_bundle is only supported for in-process/runtime APIs; "
-                    "MegatronService subprocess jobs must use moe_routing_replay_path."
-                )
-            job = MegatronTrainingJob(
-                lora_path=lora_path,
-                optimizer_state_path=self._optimizer_state_path,
-                disk_packed_tensors=disk_packed_tensors,
-                config=config,
-                experimental_config=_config,
-                moe_routing_replay_path=_config.get("moe_routing_replay_path"),
-                moe_routing_replay_strict=_config.get(
-                    "moe_routing_replay_strict", True
-                ),
-            )
-            job_path = os.path.join(
-                jobs_dir, f"{datetime.datetime.now().isoformat()}.json"
-            )
-            with open(job_path, "w", encoding="utf-8") as handle:
-                handle.write(job.model_dump_json())
-
-            num_lines = 0
-            while True:
-                await asyncio.sleep(0.1)
-                try:
-                    with open(
-                        "/tmp/megatron_training_log.jsonl", "a+", encoding="utf-8"
-                    ) as log_file:
-                        log_file.seek(0)
-                        lines = log_file.readlines()[num_lines:]
-                        for line in lines:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            if line == "all done":
-                                self._merge_lora_adapter(lora_path)
-                                os.remove("/tmp/megatron_training_log.jsonl")
-                                break
-                            num_lines += 1
-                            yield json.loads(line)
-                        else:
-                            continue
-                        break
-                except FileNotFoundError:
-                    continue
-
             next_step = self._latest_step + 1
+            if self.rollout_weights_mode == "merged":
+                await self._init_merged_weight_transfer()
+                job: MegatronJob = MegatronMergedTrainJob(
+                    kind="train_merged",
+                    lora_path=lora_path,
+                    optimizer_state_path=self._optimizer_state_path,
+                    disk_packed_tensors=disk_packed_tensors,
+                    config=config,
+                    experimental_config=_config,
+                    moe_routing_replay_path=_config.get("moe_routing_replay_path"),
+                    moe_routing_replay_strict=_config.get(
+                        "moe_routing_replay_strict",
+                        True,
+                    ),
+                    merged_weight_transfer=self._build_merged_weight_transfer_spec(
+                        next_step
+                    ),
+                )
+            else:
+                job = MegatronLoraTrainJob(
+                    kind="train_lora",
+                    lora_path=lora_path,
+                    optimizer_state_path=self._optimizer_state_path,
+                    disk_packed_tensors=disk_packed_tensors,
+                    config=config,
+                    experimental_config=_config,
+                    moe_routing_replay_path=_config.get("moe_routing_replay_path"),
+                    moe_routing_replay_strict=_config.get(
+                        "moe_routing_replay_strict",
+                        True,
+                    ),
+                )
+            job_path = self._write_job(job)
+            async for result in self._stream_training_log(
+                job_path=job_path,
+                lora_path=lora_path,
+            ):
+                yield result
+
             new_checkpoint_dir = get_step_checkpoint_dir(self.output_dir, next_step)
             os.makedirs(new_checkpoint_dir, exist_ok=True)
             shutil.copy(
                 f"{lora_path}/adapter_model.safetensors",
                 f"{new_checkpoint_dir}/adapter_model.safetensors",
             )
-            self._ensure_lora_adapter_config(new_checkpoint_dir, source_path=lora_path)
-            await self._reload_adapter(new_checkpoint_dir, next_step)
+            self._ensure_lora_adapter_config(new_checkpoint_dir)
+            if self.rollout_weights_mode == "merged":
+                self._latest_step = next_step
+            else:
+                await self._reload_adapter(new_checkpoint_dir, next_step)
             return
 
         llm = await self.llm
@@ -530,17 +631,8 @@ class MegatronService:
 
         self._optimizer_state_path = self._get_optimizer_state_path()
 
-        jobs_dir = "/tmp/megatron_training_jobs"
-        os.makedirs(jobs_dir, exist_ok=True)
-        for job_name in os.listdir(jobs_dir):
-            if job_name.endswith(".json"):
-                os.remove(os.path.join(jobs_dir, job_name))
-        if _config.get("moe_routing_replay_bundle") is not None:
-            raise RuntimeError(
-                "moe_routing_replay_bundle is only supported for in-process/runtime APIs; "
-                "MegatronService subprocess jobs must use moe_routing_replay_path."
-            )
-        job = MegatronTrainingJob(
+        job = MegatronLoraTrainJob(
+            kind="train_lora",
             lora_path=lora_path,
             optimizer_state_path=self._optimizer_state_path,
             disk_packed_tensors=disk_packed_tensors,
@@ -549,30 +641,12 @@ class MegatronService:
             moe_routing_replay_path=_config.get("moe_routing_replay_path"),
             moe_routing_replay_strict=_config.get("moe_routing_replay_strict", True),
         )
-        job_path = os.path.join(jobs_dir, f"{datetime.datetime.now().isoformat()}.json")
-        with open(job_path, "w") as f:
-            f.write(job.model_dump_json())
-
-        num_lines = 0
-        while True:
-            await asyncio.sleep(0.1)
-            try:
-                with open("/tmp/megatron_training_log.jsonl", "a+") as log_file:
-                    log_file.seek(0)
-                    lines = log_file.readlines()[num_lines:]
-                    for line in lines:
-                        if line := line.strip():
-                            if line == "all done":
-                                self._merge_lora_adapter(lora_path)
-                                os.remove("/tmp/megatron_training_log.jsonl")
-                                break
-                            num_lines += 1
-                            yield json.loads(line)
-                    else:
-                        continue
-                    break
-            except FileNotFoundError:
-                continue
+        job_path = self._write_job(job)
+        async for result in self._stream_training_log(
+            job_path=job_path,
+            lora_path=lora_path,
+        ):
+            yield result
 
         next_step = self._latest_step + 1
         new_checkpoint_dir = get_step_checkpoint_dir(self.output_dir, next_step)
@@ -581,7 +655,7 @@ class MegatronService:
             f"{lora_path}/adapter_model.safetensors",
             f"{new_checkpoint_dir}/adapter_model.safetensors",
         )
-        self._ensure_lora_adapter_config(new_checkpoint_dir, source_path=lora_path)
+        self._ensure_lora_adapter_config(new_checkpoint_dir)
 
         wake_lock_path = "/tmp/megatron_vllm_waking"
         try:

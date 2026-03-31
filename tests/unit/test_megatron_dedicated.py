@@ -13,6 +13,10 @@ pytest.importorskip("vllm")
 from art import TrainableModel, types
 from art.dev.model import InternalModelConfig
 from art.megatron.backend import MegatronBackend
+from art.megatron.job_protocol import (
+    MegatronMergedTrainJob,
+    MergedWeightTransferInitInfo,
+)
 from art.megatron.service import MegatronService
 
 
@@ -61,7 +65,9 @@ async def test_megatron_backend_dedicated_uses_trainer_gpus_without_child_proces
     monkeypatch.setattr(
         "art.megatron.backend.move_to_child_process",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("Dedicated Megatron service should not move to a child process")
+            AssertionError(
+                "Dedicated Megatron service should not move to a child process"
+            )
         ),
     )
     monkeypatch.setattr("art.megatron.service.MegatronService", FakeService)
@@ -95,16 +101,20 @@ async def test_megatron_service_ensure_megatron_running_uses_trainer_gpus(
 
     seen: dict[str, Any] = {}
 
-    monkeypatch.setattr("art.megatron.service.subprocess.run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "art.megatron.service.subprocess.run", lambda *args, **kwargs: None
+    )
 
     async def fake_create_subprocess_shell(
         command: str,
         cwd: str,
         env: dict[str, str],
+        start_new_session: bool,
     ) -> Any:
         seen["command"] = command
         seen["cwd"] = cwd
         seen["env"] = env
+        seen["start_new_session"] = start_new_session
         return pytypes.SimpleNamespace(returncode=None)
 
     monkeypatch.setattr(
@@ -119,6 +129,7 @@ async def test_megatron_service_ensure_megatron_running_uses_trainer_gpus(
     assert "--nproc_per_node 2" in seen["command"]
     assert seen["env"]["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert seen["env"]["MODEL_IDENTIFIER"] == "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert seen["start_new_session"] is True
 
 
 @pytest.mark.asyncio
@@ -145,7 +156,7 @@ async def test_megatron_service_start_openai_server_dedicated_starts_subprocess(
         lambda _output_dir: str(checkpoint_dir),
     )
     monkeypatch.setattr(service, "_ensure_identity_lora", lambda _path: None)
-    monkeypatch.setattr(service, "_ensure_lora_adapter_config", lambda _path, source_path=None: None)
+    monkeypatch.setattr(service, "_ensure_lora_adapter_config", lambda _path: None)
 
     async def fake_start_vllm_subprocess(
         lora_path: str,
@@ -186,9 +197,208 @@ async def test_megatron_service_register_lora_for_step_dedicated_reloads_adapter
     monkeypatch.setattr(
         service,
         "_reload_adapter",
-        lambda checkpoint_dir, step: seen.append((checkpoint_dir, step)) or asyncio.sleep(0),
+        lambda checkpoint_dir, step: seen.append((checkpoint_dir, step))
+        or asyncio.sleep(0),
     )
 
     await service.register_lora_for_step(3, "/tmp/checkpoints/3")
 
     assert seen == [("/tmp/checkpoints/3", 3)]
+
+
+@pytest.mark.asyncio
+async def test_megatron_service_start_openai_server_merged_syncs_step_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_dir = tmp_path / "checkpoints" / "0000"
+    checkpoint_dir.mkdir(parents=True)
+    service = MegatronService(
+        model_name="megatron-merged",
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        config=InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1],
+            rollout_weights_mode="merged",
+        ),
+        output_dir=str(tmp_path),
+    )
+    calls: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(
+        "art.megatron.service.get_last_checkpoint_dir",
+        lambda _output_dir: str(checkpoint_dir),
+    )
+    monkeypatch.setattr(service, "_ensure_lora_adapter_config", lambda _path: None)
+    monkeypatch.setattr(
+        service,
+        "_start_vllm_subprocess",
+        lambda lora_path, port, config: asyncio.sleep(0, result=("127.0.0.1", port)),
+    )
+    monkeypatch.setattr(
+        service,
+        "_sync_dedicated_merged_weights",
+        lambda *, lora_path, step: calls.append((lora_path, step)) or asyncio.sleep(0),
+    )
+
+    location = await service.start_openai_server({"server_args": {"port": 8123}})
+
+    assert location == ("127.0.0.1", 8123)
+    assert calls == [(str(checkpoint_dir), 0)]
+
+
+@pytest.mark.asyncio
+async def test_megatron_service_register_lora_for_step_merged_sets_served_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = MegatronService(
+        model_name="megatron-merged",
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        config=InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1],
+            rollout_weights_mode="merged",
+        ),
+        output_dir=str(tmp_path),
+    )
+    calls: list[int] = []
+
+    monkeypatch.setattr(
+        service,
+        "_set_served_model_name",
+        lambda step: calls.append(step) or asyncio.sleep(0),
+    )
+
+    await service.register_lora_for_step(3, "/tmp/checkpoints/3")
+
+    assert calls == [3]
+
+
+@pytest.mark.asyncio
+async def test_megatron_service_write_job_uses_merged_job_kind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = MegatronService(
+        model_name="megatron-merged",
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        config=InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1],
+            rollout_weights_mode="merged",
+        ),
+        output_dir=str(tmp_path),
+    )
+    job_dir = Path("/tmp/megatron_training_jobs")
+    log_path = Path("/tmp/megatron_training_log.jsonl")
+    if job_dir.exists():
+        for path in job_dir.glob("*.json"):
+            path.unlink()
+    if log_path.exists():
+        log_path.unlink()
+
+    service._merged_weight_transfer_init_info = MergedWeightTransferInitInfo(
+        master_address="127.0.0.1",
+        master_port=1234,
+        rank_offset=1,
+        world_size=2,
+    )
+
+    job_path = service._write_job(
+        MegatronMergedTrainJob(
+            kind="train_merged",
+            lora_path="/tmp/checkpoint",
+            optimizer_state_path="/tmp/optimizer",
+            disk_packed_tensors={
+                "dir": "/tmp/tensors",
+                "num_sequences": 1,
+                "sequence_length": 16,
+            },
+            config=types.TrainConfig(learning_rate=5e-5),
+            experimental_config={},
+            merged_weight_transfer=service._build_merged_weight_transfer_spec(1),
+        )
+    )
+
+    with open(job_path, "r", encoding="utf-8") as handle:
+        job = MegatronMergedTrainJob.model_validate_json(handle.read())
+
+    assert job.kind == "train_merged"
+    assert job.merged_weight_transfer.served_model_name == "megatron-merged@1"
+
+
+@pytest.mark.asyncio
+async def test_megatron_service_train_merged_writes_merged_job_and_does_not_reload_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_dir = tmp_path / "checkpoints" / "0000"
+    checkpoint_dir.mkdir(parents=True)
+    adapter_path = checkpoint_dir / "adapter_model.safetensors"
+    adapter_path.write_bytes(b"adapter")
+    service = MegatronService(
+        model_name="megatron-merged",
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        config=InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1],
+            rollout_weights_mode="merged",
+        ),
+        output_dir=str(tmp_path),
+    )
+    events: list[Any] = []
+
+    monkeypatch.setattr(
+        service,
+        "_ensure_megatron_running",
+        lambda: events.append("ensure") or asyncio.sleep(0),
+    )
+    monkeypatch.setattr(
+        service, "_resolve_active_lora_path", lambda: str(checkpoint_dir)
+    )
+    monkeypatch.setattr(
+        service,
+        "_init_merged_weight_transfer",
+        lambda: events.append("init") or asyncio.sleep(0),
+    )
+    monkeypatch.setattr(
+        service,
+        "_write_job",
+        lambda job: events.append(job) or "/tmp/job.json",
+    )
+
+    async def fake_stream_training_log(*, job_path: str, lora_path: str):
+        events.append(("stream", job_path, lora_path))
+        yield {"loss": 1.0}
+
+    monkeypatch.setattr(service, "_stream_training_log", fake_stream_training_log)
+    monkeypatch.setattr(service, "_ensure_lora_adapter_config", lambda _path: None)
+    monkeypatch.setattr(
+        service,
+        "_reload_adapter",
+        lambda checkpoint_dir, step: (_ for _ in ()).throw(
+            AssertionError("merged mode should not hot-reload a LoRA adapter")
+        ),
+    )
+    service._merged_weight_transfer_init_info = MergedWeightTransferInitInfo(
+        master_address="127.0.0.1",
+        master_port=1234,
+        rank_offset=1,
+        world_size=2,
+    )
+
+    results = []
+    async for result in service.train(
+        {"dir": "/tmp/tensors", "num_sequences": 1, "sequence_length": 16},
+        types.TrainConfig(learning_rate=5e-5),
+        {},
+    ):
+        results.append(result)
+
+    assert results == [{"loss": 1.0}]
+    assert events[0:2] == ["ensure", "init"]
+    job = events[2]
+    assert isinstance(job, MegatronMergedTrainJob)
+    assert job.merged_weight_transfer.served_model_name == "megatron-merged@1"
+    assert events[3] == ("stream", "/tmp/job.json", str(checkpoint_dir))

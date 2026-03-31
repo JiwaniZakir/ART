@@ -15,9 +15,11 @@ _set_cache_dir("TORCHINDUCTOR_CACHE_DIR", "~/.cache/torchinductor")
 _set_cache_dir("TRITON_CACHE_DIR", "~/.triton/cache")
 # isort: on
 
+from concurrent.futures import ThreadPoolExecutor
 import gc
 import json
 import math
+import re
 import shutil
 import time
 from typing import Any, Callable, cast
@@ -27,6 +29,7 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from pydantic import BaseModel, ConfigDict
 from safetensors.torch import load_file, save_file
 import torch
@@ -36,7 +39,20 @@ from art import dev, types
 from art.loss import loss_fn, shift_tensor
 from art.megatron.finalize_grads import finalize_model_grads_extended
 from art.megatron.flex_attention import create_shared_prefix_attention_state
-from art.megatron.lora import apply_lora_adapters
+from art.megatron.job_protocol import (
+    MegatronMergedTrainJob,
+    MergedWeightTransferInitInfo,
+    MergedWeightTransferSpec,
+    load_megatron_job,
+)
+from art.megatron.lora import (
+    LoRA,
+    MLPExpertsLinearFC1LoRA,
+    MLPExpertsLinearFC2LoRA,
+    SelfAttentionLinearProjLoRA,
+    SelfAttentionLinearQKVLoRA,
+    apply_lora_adapters,
+)
 from art.megatron.offload import (
     OffloadState,
     clear_optimizer_state,
@@ -57,22 +73,6 @@ from art.preprocessing.pack import (
 DEFAULT_MODEL_IDENTIFIER = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 
 
-class TrainingJob(BaseModel):
-    lora_path: str
-    optimizer_state_path: str
-    disk_packed_tensors: DiskPackedTensors
-    config: types.TrainConfig
-    experimental_config: dev.TrainConfig
-    moe_routing_replay_path: str | None = None
-    moe_routing_replay_strict: bool = True
-
-
-TrainingJob.model_rebuild(
-    force=True,
-    _types_namespace={"MoeRoutingReplayBundle": MoeRoutingReplayBundle},
-)
-
-
 class TrainingRuntime(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -82,6 +82,8 @@ class TrainingRuntime(BaseModel):
     rank: int
     world_size: int
     moe_routing_replay_controller: MoeRoutingReplayController | None = None
+    merged_weight_transfer_group: Any | None = None
+    merged_weight_transfer_init_info: MergedWeightTransferInitInfo | None = None
 
 
 class TrainStepResult(BaseModel):
@@ -305,6 +307,18 @@ def iter_modules(model_chunks: list[MegatronModule]) -> Any:
             yield module
 
 
+def iter_named_modules(model_chunks: list[MegatronModule]) -> Any:
+    for chunk in model_chunks:
+        for module_name, module in chunk.named_modules():
+            yield module_name, module
+
+
+def _is_language_transformer_layer_name(module_name: str) -> bool:
+    while module_name.startswith("module."):
+        module_name = module_name.removeprefix("module.")
+    return module_name.startswith(("decoder.layers.", "language_model.decoder.layers."))
+
+
 def load_adapter_into_model(
     model_chunks: list[MegatronModule],
     adapter_model: dict[str, torch.Tensor],
@@ -318,6 +332,22 @@ def load_adapter_into_model(
     if optimizer is None:
         return
     optimizer.reload_model_params()
+
+
+def maybe_load_adapter_into_model(
+    model_chunks: list[MegatronModule],
+    adapter_model_path: str,
+    optimizer: Any | None = None,
+    *,
+    rank: int,
+) -> dict[str, torch.Tensor]:
+    if not os.path.exists(adapter_model_path):
+        print0(rank, "No adapter model found at", adapter_model_path)
+        return {}
+    print0(rank, "Loading adapter model from", adapter_model_path)
+    adapter_model = load_file(adapter_model_path)
+    load_adapter_into_model(model_chunks, adapter_model, optimizer)
+    return adapter_model
 
 
 def collect_sharded_lora_state(
@@ -582,6 +612,397 @@ def run_training_step(
     )
 
 
+def _is_art_adapter_param_name(name: str) -> bool:
+    return any(
+        segment in name
+        for segment in (
+            ".lora.",
+            ".q_proj_lora.",
+            ".k_proj_lora.",
+            ".v_proj_lora.",
+            ".gate_lora.",
+            ".up_lora.",
+        )
+    )
+
+
+def _unwrap_art_wrapper_name(name: str) -> str:
+    while name.startswith("module."):
+        name = name[len("module.") :]
+    for wrapped, unwrapped in (
+        (".linear_proj.linear_proj.", ".linear_proj."),
+        (".linear_qkv.linear_qkv.", ".linear_qkv."),
+        (".linear_fc1.linear_fc1.", ".linear_fc1."),
+        (".linear_fc2.linear_fc2.", ".linear_fc2."),
+    ):
+        name = name.replace(wrapped, unwrapped)
+    return name
+
+
+def _mapping_hf_weights_exist(mapping: Any, hf_keys: set[str]) -> bool:
+    if getattr(mapping, "allow_hf_name_mismatch", False):
+        return True
+    hf_param = mapping.hf_param
+    if isinstance(hf_param, str):
+        return hf_param in hf_keys
+    assert isinstance(hf_param, dict)
+    return all(param in hf_keys for param in hf_param.values())
+
+
+def _lora_delta(lora: LoRA, expert_idx: int | None = None) -> torch.Tensor:
+    if lora.A_T.ndim == 3:
+        assert expert_idx is not None
+        a_t = lora.A_T[expert_idx]
+        b_t = lora.B_T[expert_idx]
+    else:
+        a_t = lora.A_T
+        b_t = lora.B_T
+    return (b_t.T @ a_t.T) * lora.scale
+
+
+def _expert_index_from_hf_name(hf_name: str) -> int:
+    match = re.search(r"\.experts\.(\d+)\.", hf_name)
+    assert match is not None
+    return int(match.group(1))
+
+
+def _hf_name_has_indexed_expert(hf_name: str) -> bool:
+    return re.search(r"\.experts\.(\d+)\.", hf_name) is not None
+
+
+def _stack_moe_fc1_deltas(handler: MLPExpertsLinearFC1LoRA) -> torch.Tensor:
+    return torch.stack(
+        [
+            torch.cat(
+                [
+                    _lora_delta(handler.gate_lora, expert_idx),
+                    _lora_delta(handler.up_lora, expert_idx),
+                ],
+                dim=0,
+            )
+            for expert_idx in range(handler.gate_lora.num_local_experts)
+        ],
+        dim=0,
+    )
+
+
+def _stack_moe_fc2_deltas(handler: MLPExpertsLinearFC2LoRA) -> torch.Tensor:
+    return torch.stack(
+        [
+            _lora_delta(handler.lora, expert_idx)
+            for expert_idx in range(handler.lora.num_local_experts)
+        ],
+        dim=0,
+    )
+
+
+def _merge_delta_into_weight(
+    hf_name: str,
+    base_weight: torch.Tensor,
+    delta: torch.Tensor,
+) -> torch.Tensor:
+    delta = delta.to(device=base_weight.device, dtype=base_weight.dtype)
+    if tuple(base_weight.shape) == tuple(delta.shape):
+        return base_weight + delta
+    transposed = delta.transpose(-1, -2)
+    assert tuple(base_weight.shape) == tuple(transposed.shape), (
+        f"{hf_name}: cannot merge delta {tuple(delta.shape)} into {tuple(base_weight.shape)}"
+    )
+    return base_weight + transposed
+
+
+def _build_art_merge_handlers(
+    model_chunks: list[MegatronModule],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    exact_handlers: dict[str, Any] = {}
+    prefix_handlers: dict[str, Any] = {}
+    for module_name, module in iter_named_modules(model_chunks):
+        if not isinstance(module, TransformerLayer):
+            continue
+        if not _is_language_transformer_layer_name(module_name):
+            continue
+        prefix = f"language_model.decoder.layers.{module.layer_number - 1}"
+        linear_proj = getattr(module.self_attention, "linear_proj", None)
+        if isinstance(linear_proj, SelfAttentionLinearProjLoRA):
+            exact_handlers[f"{prefix}.self_attention.linear_proj.weight"] = linear_proj
+        linear_qkv = getattr(module.self_attention, "linear_qkv", None)
+        if isinstance(linear_qkv, SelfAttentionLinearQKVLoRA):
+            exact_handlers[f"{prefix}.self_attention.linear_qkv.weight"] = linear_qkv
+        experts = getattr(module.mlp, "experts", None)
+        if experts is None:
+            continue
+        if isinstance(experts.linear_fc1, MLPExpertsLinearFC1LoRA):
+            prefix_handlers[f"{prefix}.mlp.experts.linear_fc1.weight"] = (
+                experts.linear_fc1
+            )
+        if isinstance(experts.linear_fc2, MLPExpertsLinearFC2LoRA):
+            prefix_handlers[f"{prefix}.mlp.experts.linear_fc2.weight"] = (
+                experts.linear_fc2
+            )
+    return exact_handlers, prefix_handlers
+
+
+def _merge_art_lora_into_hf_weights(
+    global_param_name: str,
+    converted_weights_dict: dict[str, torch.Tensor],
+    *,
+    exact_handlers: dict[str, Any],
+    prefix_handlers: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    handler = exact_handlers.get(global_param_name)
+    if handler is None:
+        for prefix, prefix_handler in prefix_handlers.items():
+            if global_param_name.startswith(prefix):
+                handler = prefix_handler
+                break
+    if handler is None:
+        return converted_weights_dict
+    if isinstance(handler, SelfAttentionLinearProjLoRA):
+        hf_name, base_weight = next(iter(converted_weights_dict.items()))
+        converted_weights_dict[hf_name] = _merge_delta_into_weight(
+            hf_name,
+            base_weight,
+            _lora_delta(handler.lora),
+        )
+        return converted_weights_dict
+    if isinstance(handler, SelfAttentionLinearQKVLoRA):
+        deltas = {
+            "q_proj": _lora_delta(handler.q_proj_lora),
+            "k_proj": _lora_delta(handler.k_proj_lora),
+            "v_proj": _lora_delta(handler.v_proj_lora),
+        }
+        for hf_name, base_weight in list(converted_weights_dict.items()):
+            for projection, delta in deltas.items():
+                if projection in hf_name:
+                    converted_weights_dict[hf_name] = _merge_delta_into_weight(
+                        hf_name,
+                        base_weight,
+                        delta,
+                    )
+                    break
+        return converted_weights_dict
+    if isinstance(handler, MLPExpertsLinearFC1LoRA):
+        for hf_name, base_weight in list(converted_weights_dict.items()):
+            delta = (
+                torch.cat(
+                    [
+                        _lora_delta(
+                            handler.gate_lora, _expert_index_from_hf_name(hf_name)
+                        ),
+                        _lora_delta(
+                            handler.up_lora, _expert_index_from_hf_name(hf_name)
+                        ),
+                    ],
+                    dim=0,
+                )
+                if _hf_name_has_indexed_expert(hf_name)
+                else _stack_moe_fc1_deltas(handler)
+            )
+            converted_weights_dict[hf_name] = _merge_delta_into_weight(
+                hf_name,
+                base_weight,
+                delta,
+            )
+        return converted_weights_dict
+    assert isinstance(handler, MLPExpertsLinearFC2LoRA)
+    for hf_name, base_weight in list(converted_weights_dict.items()):
+        delta = (
+            _lora_delta(handler.lora, _expert_index_from_hf_name(hf_name))
+            if _hf_name_has_indexed_expert(hf_name)
+            else _stack_moe_fc2_deltas(handler)
+        )
+        converted_weights_dict[hf_name] = _merge_delta_into_weight(
+            hf_name,
+            base_weight,
+            delta,
+        )
+    return converted_weights_dict
+
+
+def _build_art_conversion_tasks(runtime: TrainingRuntime) -> list[Any]:
+    from itertools import chain
+
+    from megatron.bridge.models.conversion.model_bridge import (
+        WeightConversionTask,
+        _megatron_local_name_to_global,
+    )
+    from megatron.bridge.models.conversion.utils import (
+        get_module_and_param_from_name,
+        persistent_buffers,
+    )
+
+    bridge = getattr(runtime.provider, "art_bridge", None)
+    assert bridge is not None
+    mapping_registry = bridge._model_bridge.mapping_registry()
+    hf_source = bridge.hf_pretrained.state.source
+    hf_keys = set(hf_source.get_all_keys())
+    model_config = runtime.model[0].config
+    tasks: list[Any] = []
+    for vp_stage, model in enumerate(runtime.model):
+        for local_name, _ in chain(model.named_parameters(), persistent_buffers(model)):
+            if "_extra_state" in local_name or _is_art_adapter_param_name(local_name):
+                continue
+            global_name = _megatron_local_name_to_global(
+                runtime.model,
+                model_config,
+                _unwrap_art_wrapper_name(local_name),
+                vp_stage,
+            )
+            mapping = mapping_registry.megatron_to_hf_lookup(global_name)
+            if mapping is None or not _mapping_hf_weights_exist(mapping, hf_keys):
+                continue
+            local_module, local_weights = get_module_and_param_from_name(
+                runtime.model,
+                local_name,
+                vp_stage,
+            )
+            if local_module is not None and not hasattr(local_module, "config"):
+                setattr(local_module, "config", model_config)
+            tasks.append(
+                WeightConversionTask(
+                    pp_rank=0,
+                    vp_stage=vp_stage,
+                    param_name=local_name,
+                    global_param_name=global_name,
+                    megatron_module=local_module,
+                    param_weight=local_weights,
+                    mapping=mapping,
+                )
+            )
+    return tasks
+
+
+def _iter_merged_vllm_weights(runtime: TrainingRuntime) -> Any:
+    # vLLM expects HF checkpoint names, but Megatron only has live trainer weights.
+    # Convert through Bridge here, then merge ART's LoRA deltas into those tensors.
+    bridge = getattr(runtime.provider, "art_bridge", None)
+    assert bridge is not None
+    model_bridge = bridge._model_bridge
+    hf_state_dict = bridge.hf_pretrained.state
+    exact_handlers, prefix_handlers = _build_art_merge_handlers(runtime.model)
+    for task in _build_art_conversion_tasks(runtime):
+        converted_weights_dict = task.mapping.megatron_to_hf(
+            task.param_weight,
+            task.megatron_module,
+        )
+        converted_weights_dict = model_bridge.maybe_modify_converted_hf_weight(
+            task,
+            converted_weights_dict,
+            hf_state_dict,
+        )
+        converted_weights_dict = _merge_art_lora_into_hf_weights(
+            task.global_param_name,
+            converted_weights_dict,
+            exact_handlers=exact_handlers,
+            prefix_handlers=prefix_handlers,
+        )
+        for hf_name, tensor in converted_weights_dict.items():
+            yield hf_name, tensor
+
+
+def _ensure_merged_weight_transfer_group(
+    runtime: TrainingRuntime,
+    spec: MergedWeightTransferSpec,
+) -> None:
+    assert runtime.rank == 0
+    assert runtime.world_size == 1
+    if runtime.merged_weight_transfer_init_info == spec.init_info:
+        assert runtime.merged_weight_transfer_group is not None
+        return
+    import httpx
+    from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
+
+    def _remote_init() -> None:
+        response = httpx.post(
+            f"{spec.vllm_base_url}/init_weight_transfer_engine",
+            json={"init_info": spec.init_info.model_dump()},
+            timeout=300.0,
+        )
+        response.raise_for_status()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        remote_future = executor.submit(_remote_init)
+        time.sleep(1.0)
+        runtime.merged_weight_transfer_group = NCCLWeightTransferEngine.trainer_init(
+            {
+                "master_address": spec.init_info.master_address,
+                "master_port": spec.init_info.master_port,
+                "world_size": spec.init_info.world_size,
+            }
+        )
+        remote_future.result()
+    runtime.merged_weight_transfer_init_info = spec.init_info
+
+
+def _sync_merged_weights_to_vllm(
+    runtime: TrainingRuntime,
+    spec: MergedWeightTransferSpec,
+    *,
+    pause_generation: bool,
+) -> None:
+    assert runtime.rank == 0
+    assert runtime.world_size == 1
+
+    import httpx
+    from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
+
+    _ensure_merged_weight_transfer_group(runtime, spec)
+
+    def _send_weights() -> None:
+        NCCLWeightTransferEngine.trainer_send_weights(
+            _iter_merged_vllm_weights(runtime),
+            {"group": runtime.merged_weight_transfer_group},
+        )
+
+    with httpx.Client() as client:
+        if pause_generation:
+            response = client.post(
+                f"{spec.vllm_base_url}/pause",
+                params={"mode": "wait"},
+                timeout=300.0,
+            )
+            response.raise_for_status()
+        try:
+            torch.cuda.synchronize()
+            names: list[str] = []
+            dtype_names: list[str] = []
+            shapes: list[list[int]] = []
+            for name, tensor in _iter_merged_vllm_weights(runtime):
+                names.append(name)
+                dtype_names.append(str(tensor.dtype).removeprefix("torch."))
+                shapes.append(list(tensor.shape))
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                send_future = executor.submit(_send_weights)
+                response = client.post(
+                    f"{spec.vllm_base_url}/update_weights",
+                    json={
+                        "update_info": {
+                            "names": names,
+                            "dtype_names": dtype_names,
+                            "shapes": shapes,
+                            "is_checkpoint_format": True,
+                        }
+                    },
+                    timeout=600.0,
+                )
+                response.raise_for_status()
+                send_future.result()
+            response = client.post(
+                f"{spec.vllm_base_url}/art/set_served_model_name",
+                json={"name": spec.served_model_name},
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            torch.cuda.synchronize()
+        finally:
+            if pause_generation:
+                response = client.post(
+                    f"{spec.vllm_base_url}/resume",
+                    timeout=30.0,
+                )
+                response.raise_for_status()
+
+
 def _run_service_loop(runtime: TrainingRuntime) -> None:
     offload_state = OffloadState()
     offload_to_cpu(runtime.model, runtime.optimizer, runtime.rank, offload_state)
@@ -606,61 +1027,70 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         job_name = job_names[0]
         job_path = os.path.join(jobs_dir, job_name)
         with open(job_path, "rb") as handle:
-            job = TrainingJob.model_validate_json(handle.read())
-        config = job.config
-        experimental_config = job.experimental_config
-
-        configure_moe_routing_replay(
-            runtime,
-            replay_bundle_path=job.moe_routing_replay_path,
-            strict=job.moe_routing_replay_strict,
-        )
+            job = load_megatron_job(handle.read())
+        if job.kind != "sync":
+            config = job.config
+            experimental_config = job.experimental_config
+            configure_moe_routing_replay(
+                runtime,
+                replay_bundle_path=job.moe_routing_replay_path,
+                strict=job.moe_routing_replay_strict,
+            )
 
         print0(runtime.rank, "Loaded job from", job_path)
         print0(runtime.rank, "Job:", job)
 
         adapter_model_path = f"{job.lora_path}/adapter_model.safetensors"
-        if not os.path.exists(adapter_model_path):
-            raise FileNotFoundError(f"No adapter model found at {adapter_model_path}")
-        print0(runtime.rank, "Loading adapter model from", adapter_model_path)
-        adapter_model = load_file(adapter_model_path)
-        load_adapter_into_model(runtime.model, adapter_model, runtime.optimizer)
-
-        optimizer_shard_path = os.path.join(
-            job.optimizer_state_path,
-            f"{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.pt",
+        adapter_model = maybe_load_adapter_into_model(
+            runtime.model,
+            adapter_model_path,
+            runtime.optimizer,
+            rank=runtime.rank,
         )
-        if os.path.exists(optimizer_shard_path):
-            print("Loading optimizer state from", optimizer_shard_path)
-            runtime.optimizer.load_state_dict(torch.load(optimizer_shard_path))
+
+        if job.kind == "sync":
+            _sync_merged_weights_to_vllm(
+                runtime,
+                job.merged_weight_transfer,
+                pause_generation=False,
+            )
         else:
-            print(
-                "No optimizer state found at",
-                optimizer_shard_path,
-                "- resetting optimizer for new run",
+            optimizer_shard_path = os.path.join(
+                job.optimizer_state_path,
+                f"{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.pt",
             )
-            clear_optimizer_state(runtime.optimizer)
-            runtime.optimizer.reload_model_params()
+            if os.path.exists(optimizer_shard_path):
+                print("Loading optimizer state from", optimizer_shard_path)
+                runtime.optimizer.load_state_dict(torch.load(optimizer_shard_path))
+            else:
+                print(
+                    "No optimizer state found at",
+                    optimizer_shard_path,
+                    "- resetting optimizer for new run",
+                )
+                clear_optimizer_state(runtime.optimizer)
+                runtime.optimizer.reload_model_params()
 
-        print0(
-            runtime.rank, "Loading packed tensors from", job.disk_packed_tensors["dir"]
-        )
-        packed_tensors = packed_tensors_from_dir(**job.disk_packed_tensors)
-        template = _clone_packed_tensors(select_indexed_inputs(packed_tensors, 0))
-        zero_template = _zero_contribution_inputs(template)
-        num_sequences = job.disk_packed_tensors["num_sequences"]
-        global_grad_accumulation_sequences = config.grad_accumulation_sequences
-        num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
-        for step_index in range(num_steps):
-            micro_indices = build_micro_sample_indices(
-                step_index=step_index,
-                num_sequences=num_sequences,
-                global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+            print0(
+                runtime.rank,
+                "Loading packed tensors from",
+                job.disk_packed_tensors["dir"],
             )
-            micro_inputs = select_micro_inputs(
-                packed_tensors, micro_indices, zero_template
-            )
-            try:
+            packed_tensors = packed_tensors_from_dir(**job.disk_packed_tensors)
+            template = _clone_packed_tensors(select_indexed_inputs(packed_tensors, 0))
+            zero_template = _zero_contribution_inputs(template)
+            num_sequences = job.disk_packed_tensors["num_sequences"]
+            global_grad_accumulation_sequences = config.grad_accumulation_sequences
+            num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
+            for step_index in range(num_steps):
+                micro_indices = build_micro_sample_indices(
+                    step_index=step_index,
+                    num_sequences=num_sequences,
+                    global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+                )
+                micro_inputs = select_micro_inputs(
+                    packed_tensors, micro_indices, zero_template
+                )
                 step_result = run_training_step(
                     model_chunks=runtime.model,
                     optimizer=runtime.optimizer,
@@ -673,58 +1103,64 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
                     sample_index=micro_indices,
                     moe_routing_replay_controller=runtime.moe_routing_replay_controller,
                 )
-            except Exception:
-                raise
-            print0(
-                runtime.rank,
-                "Correlation between old and new probabilities:",
-                step_result.probs_corr,
+                print0(
+                    runtime.rank,
+                    "Correlation between old and new probabilities:",
+                    step_result.probs_corr,
+                )
+
+                if runtime.rank == 0:
+                    with open(
+                        "/tmp/megatron_training_log.jsonl", "a+", encoding="utf-8"
+                    ) as log_file:
+                        log_msg = json.dumps(
+                            {
+                                "loss": step_result.reduced_loss.item(),
+                                "grad_norm": step_result.grad_norm,
+                                "probs_corr": step_result.probs_corr,
+                            }
+                        )
+                        print("Logging", log_msg)
+                        log_file.write(log_msg + "\n")
+
+            sharded_state_dict, sharded_state_manifest = collect_sharded_lora_state(
+                runtime.model,
+                adapter_model,
             )
+            shard_path = os.path.join(
+                job.lora_path,
+                f"adapter_model-{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.safetensors",
+            )
+            manifest_path = os.path.join(
+                job.lora_path,
+                f"adapter_manifest-{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.json",
+            )
+            print("Saving adapter shard to", shard_path)
+            save_file(sharded_state_dict, shard_path)
+            print("Saving adapter shard manifest to", manifest_path)
+            with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+                json.dump(sharded_state_manifest, manifest_file, sort_keys=True)
 
-            if runtime.rank == 0:
-                with open(
-                    "/tmp/megatron_training_log.jsonl", "a+", encoding="utf-8"
-                ) as log_file:
-                    log_msg = json.dumps(
-                        {
-                            "loss": step_result.reduced_loss.item(),
-                            "grad_norm": step_result.grad_norm,
-                            "probs_corr": step_result.probs_corr,
-                        }
-                    )
-                    print("Logging", log_msg)
-                    log_file.write(log_msg + "\n")
+            print("Saving optimizer shard to", optimizer_shard_path)
+            os.makedirs(job.optimizer_state_path, exist_ok=True)
+            torch.save(runtime.optimizer.state_dict(), optimizer_shard_path)
 
-        sharded_state_dict, sharded_state_manifest = collect_sharded_lora_state(
-            runtime.model,
-            adapter_model,
-        )
-        shard_path = os.path.join(
-            job.lora_path,
-            f"adapter_model-{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.safetensors",
-        )
-        manifest_path = os.path.join(
-            job.lora_path,
-            f"adapter_manifest-{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.json",
-        )
-        print("Saving adapter shard to", shard_path)
-        save_file(sharded_state_dict, shard_path)
-        print("Saving adapter shard manifest to", manifest_path)
-        with open(manifest_path, "w", encoding="utf-8") as manifest_file:
-            json.dump(sharded_state_manifest, manifest_file, sort_keys=True)
-
-        print("Saving optimizer shard to", optimizer_shard_path)
-        os.makedirs(job.optimizer_state_path, exist_ok=True)
-        torch.save(runtime.optimizer.state_dict(), optimizer_shard_path)
+            if isinstance(job, MegatronMergedTrainJob):
+                _sync_merged_weights_to_vllm(
+                    runtime,
+                    job.merged_weight_transfer,
+                    pause_generation=True,
+                )
 
         offload_to_cpu(runtime.model, runtime.optimizer, runtime.rank, offload_state)
 
-        del packed_tensors
-        del template
-        del zero_template
+        if job.kind != "sync":
+            del packed_tensors
+            del template
+            del zero_template
+            if "micro_inputs" in locals():
+                del micro_inputs
         del adapter_model
-        if "micro_inputs" in locals():
-            del micro_inputs
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -735,7 +1171,8 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
                 "/tmp/megatron_training_log.jsonl", "a+", encoding="utf-8"
             ) as log_file:
                 log_file.write("all done\n")
-            shutil.rmtree(job.disk_packed_tensors["dir"])
+            if job.kind != "sync":
+                shutil.rmtree(job.disk_packed_tensors["dir"])
 
 
 def main() -> None:
