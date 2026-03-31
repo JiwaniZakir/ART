@@ -473,7 +473,7 @@ def collect_sharded_lora_state(
                 target_dtype = (
                     adapter_model[key].dtype if key in adapter_model else value.dtype
                 )
-                sharded_state_dict[key] = value.to(target_dtype)
+                sharded_state_dict[key] = value.to(target_dtype).contiguous()
         if hasattr(module, "sharded_lora_manifest"):
             module_sharded_lora_manifest: dict[str, dict[str, Any]] = (
                 module.sharded_lora_manifest()  # type: ignore[attr-defined]

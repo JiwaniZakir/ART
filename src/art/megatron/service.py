@@ -437,7 +437,7 @@ class MegatronService:
                 ]
                 concat_dim = 1 if "lora_A" in key else 0
                 tensor = torch.cat(ordered_shards, dim=concat_dim)
-            adapter_model[key] = tensor
+            adapter_model[key] = tensor.contiguous()
 
         adapter_model_path = base_dir / "adapter_model.safetensors"
         save_file(adapter_model, adapter_model_path)
