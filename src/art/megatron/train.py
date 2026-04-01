@@ -21,6 +21,7 @@ _set_cache_dir("TRITON_CACHE_DIR", "~/.triton/cache")
 import gc
 import json
 import math
+import random
 import shutil
 import time
 from typing import Any, Callable, cast
@@ -340,6 +341,12 @@ def build_training_runtime(
     print_env: bool = True,
     print_optimizer_stats: bool = True,
 ) -> TrainingRuntime:
+    if random_state := os.environ.get("ART_MEGATRON_RANDOM_STATE"):
+        seed = int(random_state)
+        random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
     _install_fast_frozen_output_backward()
     _install_intranode_deepep_buffer_patch()
     _install_deepep_metadata_release_patch()
@@ -730,11 +737,18 @@ def run_training_step(
 def _run_service_loop(runtime: TrainingRuntime) -> None:
     offload_state = OffloadState()
     offload_to_cpu(runtime.model, runtime.optimizer, runtime.rank, offload_state)
+    jobs_dir = os.environ.get("ART_MEGATRON_JOBS_DIR", "/tmp/megatron_training_jobs")
+    training_log_path = os.environ.get(
+        "ART_MEGATRON_TRAINING_LOG_PATH", "/tmp/megatron_training_log.jsonl"
+    )
+    wake_lock_path = os.environ.get(
+        "ART_MEGATRON_WAKE_LOCK_PATH", "/tmp/megatron_vllm_waking"
+    )
+    os.makedirs(jobs_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(training_log_path), exist_ok=True)
 
     while True:
         torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
-        jobs_dir = "/tmp/megatron_training_jobs"
-        os.makedirs(jobs_dir, exist_ok=True)
         job_names = sorted(
             job_name for job_name in os.listdir(jobs_dir) if job_name.endswith(".json")
         )
@@ -742,7 +756,6 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
             time.sleep(1)
             continue
 
-        wake_lock_path = "/tmp/megatron_vllm_waking"
         while os.path.exists(wake_lock_path):
             time.sleep(0.2)
 
@@ -828,9 +841,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
             )
 
             if runtime.rank == 0:
-                with open(
-                    "/tmp/megatron_training_log.jsonl", "a+", encoding="utf-8"
-                ) as log_file:
+                with open(training_log_path, "a+", encoding="utf-8") as log_file:
                     log_msg = json.dumps(
                         {
                             "loss": step_result.reduced_loss.item(),
@@ -876,9 +887,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
         if runtime.rank == 0:
             os.remove(job_path)
-            with open(
-                "/tmp/megatron_training_log.jsonl", "a+", encoding="utf-8"
-            ) as log_file:
+            with open(training_log_path, "a+", encoding="utf-8") as log_file:
                 log_file.write("all done\n")
             shutil.rmtree(job.disk_packed_tensors["dir"])
 

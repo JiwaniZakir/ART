@@ -62,6 +62,23 @@ class MegatronService:
     _megatron_process: asyncio.subprocess.Process | None = None
     _optimizer_state_path: str | None = None
 
+    def _megatron_random_state(self) -> int | None:
+        for config_key in ("peft_args", "init_args"):
+            random_state = self.config.get(config_key, {}).get("random_state")
+            if random_state is not None:
+                return int(random_state)
+        return None
+
+    def _megatron_runtime_paths(self) -> tuple[str, str, str]:
+        runtime_dir = Path(self.output_dir) / "megatron_runtime"
+        jobs_dir = runtime_dir / "jobs"
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        return (
+            str(jobs_dir),
+            str(runtime_dir / "training_log.jsonl"),
+            str(runtime_dir / "vllm_waking.lock"),
+        )
+
     def _next_lora_id(self) -> int:
         self._lora_id_counter += 1
         return self._lora_id_counter
@@ -103,6 +120,9 @@ class MegatronService:
         from peft import get_peft_model
         from transformers import AutoConfig, AutoModelForCausalLM
 
+        random_state = self._megatron_random_state()
+        if random_state is not None:
+            torch.manual_seed(random_state)
         base_config = AutoConfig.from_pretrained(
             self.base_model,
             trust_remote_code=True,
@@ -206,11 +226,18 @@ class MegatronService:
             setup_script = Path(__file__).parent / "setup.sh"
             setup_cmd = f"bash {setup_script} && "
 
-        subprocess.run(["pkill", "-9", "megatron-service"], check=False)
         train_script = Path(__file__).parent / "train.py"
         project_root = Path(__file__).resolve().parents[3]
         num_gpus = torch.cuda.device_count()
-        os.environ["MODEL_IDENTIFIER"] = self.base_model
+        jobs_dir, training_log_path, wake_lock_path = self._megatron_runtime_paths()
+        env = os.environ.copy()
+        env["MODEL_IDENTIFIER"] = self.base_model
+        env["ART_MEGATRON_JOBS_DIR"] = jobs_dir
+        env["ART_MEGATRON_TRAINING_LOG_PATH"] = training_log_path
+        env["ART_MEGATRON_WAKE_LOCK_PATH"] = wake_lock_path
+        random_state = self._megatron_random_state()
+        if random_state is not None:
+            env["ART_MEGATRON_RANDOM_STATE"] = str(random_state)
 
         command = (
             f"{setup_cmd}uv run --project {shlex.quote(str(project_root))} "
@@ -219,6 +246,7 @@ class MegatronService:
         self._megatron_process = await asyncio.create_subprocess_shell(
             command,
             cwd=str(project_root),
+            env=env,
         )
 
     async def start_openai_server(
@@ -278,11 +306,12 @@ class MegatronService:
 
         self._optimizer_state_path = self._get_optimizer_state_path()
 
-        jobs_dir = "/tmp/megatron_training_jobs"
-        os.makedirs(jobs_dir, exist_ok=True)
+        jobs_dir, training_log_path, wake_lock_path = self._megatron_runtime_paths()
         for job_name in os.listdir(jobs_dir):
             if job_name.endswith(".json"):
                 os.remove(os.path.join(jobs_dir, job_name))
+        if os.path.exists(training_log_path):
+            os.remove(training_log_path)
         if _config.get("moe_routing_replay_bundle") is not None:
             raise RuntimeError(
                 "moe_routing_replay_bundle is only supported for in-process/runtime APIs; "
@@ -305,14 +334,14 @@ class MegatronService:
         while True:
             await asyncio.sleep(0.1)
             try:
-                with open("/tmp/megatron_training_log.jsonl", "a+") as log_file:
+                with open(training_log_path, "a+") as log_file:
                     log_file.seek(0)
                     lines = log_file.readlines()[num_lines:]
                     for line in lines:
                         if line := line.strip():
                             if line == "all done":
                                 self._merge_lora_adapter(lora_path)
-                                os.remove("/tmp/megatron_training_log.jsonl")
+                                os.remove(training_log_path)
                                 break
                             num_lines += 1
                             yield json.loads(line)
@@ -331,7 +360,6 @@ class MegatronService:
         )
         self._ensure_lora_adapter_config(new_checkpoint_dir, source_path=lora_path)
 
-        wake_lock_path = "/tmp/megatron_vllm_waking"
         try:
             with open(wake_lock_path, "w") as lock_file:
                 lock_file.write("waking vllm\n")
