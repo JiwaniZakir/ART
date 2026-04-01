@@ -24,32 +24,12 @@ def _iter_megatron_param_buffers(model: Sequence[torch.nn.Module]) -> Iterator[A
             yield from expert_buffers
 
 
-def _iter_megatron_optimizers(optimizer: Any) -> Iterator[Any]:
-    chained_optimizers = getattr(optimizer, "chained_optimizers", None)
-    if chained_optimizers is None:
-        yield optimizer
-        return
-    for child_optimizer in chained_optimizers:
-        yield from _iter_megatron_optimizers(child_optimizer)
-
-
-def iter_optimizer_state_items(optimizer: Any) -> Iterator[tuple[Any, dict[str, Any]]]:
-    for megatron_optimizer in _iter_megatron_optimizers(optimizer):
-        yield from megatron_optimizer.state.items()
-
-
-def clear_optimizer_state(optimizer: Any) -> None:
-    for megatron_optimizer in _iter_megatron_optimizers(optimizer):
-        megatron_optimizer.state.clear()
-
-
 def offload_to_cpu(
     model: Sequence[torch.nn.Module],
-    optimizer: Any,
     rank: int,
     offload_state: OffloadState,
 ) -> None:
-    """Offload model params and optimizer state to CPU pinned memory."""
+    """Offload model params to CPU pinned memory."""
     if offload_state.is_offloaded:
         return
     pinned_buffers = offload_state.pinned_buffers
@@ -79,25 +59,21 @@ def offload_to_cpu(
             pinned_buffers[key].copy_(param.data, non_blocking=True)
             param.data = pinned_buffers[key]
 
-    for megatron_optimizer in _iter_megatron_optimizers(optimizer):
-        megatron_optimizer.offload_to_cpu()
-
     torch.cuda.synchronize()
     gc.collect()
     torch.cuda.empty_cache()
     offload_state.is_offloaded = True
     if rank == 0:
-        print("Offloaded model params and optimizer to CPU")
+        print("Offloaded model params to CPU")
 
 
 def reload_to_gpu(
     model: Sequence[torch.nn.Module],
-    optimizer: Any,
     rank: int,
     offload_state: OffloadState,
     device: torch.device | str | None = None,
 ) -> None:
-    """Reload model params and optimizer state to GPU."""
+    """Reload model params to GPU."""
     if not offload_state.is_offloaded:
         return
 
@@ -122,10 +98,7 @@ def reload_to_gpu(
             gpu_tensor.copy_(param.data, non_blocking=True)
             param.data = gpu_tensor
 
-    for megatron_optimizer in _iter_megatron_optimizers(optimizer):
-        megatron_optimizer.restore_from_cpu()
-
     torch.cuda.synchronize()
     offload_state.is_offloaded = False
     if rank == 0:
-        print("Reloaded LoRA params and optimizer to GPU")
+        print("Reloaded LoRA params to GPU")
