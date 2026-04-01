@@ -241,15 +241,19 @@ class MegatronService:
         env["ART_MEGATRON_JOBS_DIR"] = jobs_dir
         env["ART_MEGATRON_TRAINING_LOG_PATH"] = training_log_path
         env["ART_MEGATRON_WAKE_LOCK_PATH"] = wake_lock_path
-        env.setdefault("MASTER_ADDR", "127.0.0.1")
-        env.setdefault("MASTER_PORT", str(self._allocate_master_port()))
+        master_addr = env.get("MASTER_ADDR", "127.0.0.1")
+        master_port = str(self._allocate_master_port())
+        env["MASTER_ADDR"] = master_addr
+        env["MASTER_PORT"] = master_port
         random_state = self._megatron_random_state()
         if random_state is not None:
             env["ART_MEGATRON_RANDOM_STATE"] = str(random_state)
 
         command = (
             f"{setup_cmd}uv run --project {shlex.quote(str(project_root))} "
-            f"torchrun --nproc_per_node {num_gpus} {shlex.quote(str(train_script))}"
+            f"torchrun --master-addr {shlex.quote(master_addr)} "
+            f"--master-port {shlex.quote(master_port)} "
+            f"--nproc_per_node {num_gpus} {shlex.quote(str(train_script))}"
         )
         self._megatron_process = await asyncio.create_subprocess_shell(
             command,
