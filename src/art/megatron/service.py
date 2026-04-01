@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import socket
 import subprocess
 from typing import Any, AsyncIterator
 
@@ -78,6 +79,11 @@ class MegatronService:
             str(runtime_dir / "training_log.jsonl"),
             str(runtime_dir / "vllm_waking.lock"),
         )
+
+    def _allocate_master_port(self) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("", 0))
+            return int(sock.getsockname()[1])
 
     def _next_lora_id(self) -> int:
         self._lora_id_counter += 1
@@ -235,6 +241,8 @@ class MegatronService:
         env["ART_MEGATRON_JOBS_DIR"] = jobs_dir
         env["ART_MEGATRON_TRAINING_LOG_PATH"] = training_log_path
         env["ART_MEGATRON_WAKE_LOCK_PATH"] = wake_lock_path
+        env.setdefault("MASTER_ADDR", "127.0.0.1")
+        env.setdefault("MASTER_PORT", str(self._allocate_master_port()))
         random_state = self._megatron_random_state()
         if random_state is not None:
             env["ART_MEGATRON_RANDOM_STATE"] = str(random_state)
