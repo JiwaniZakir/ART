@@ -248,6 +248,13 @@ class MegatronService:
         random_state = self._megatron_random_state()
         if random_state is not None:
             env["ART_MEGATRON_RANDOM_STATE"] = str(random_state)
+        tensor_parallel_size = self.config.get("engine_args", {}).get(
+            "tensor_parallel_size"
+        )
+        if tensor_parallel_size is not None:
+            env["ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE"] = str(
+                int(tensor_parallel_size)
+            )
 
         command = (
             f"{setup_cmd}uv run --project {shlex.quote(str(project_root))} "

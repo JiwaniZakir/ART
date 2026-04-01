@@ -146,7 +146,7 @@ def _apply_default_parallel_topology(provider: GPTModelProvider) -> None:
     provider.tensor_model_parallel_size = min(2, visible_gpu_count)
     provider.context_parallel_size = 1
     provider.pipeline_model_parallel_size = 1
-    provider.expert_tensor_parallel_size = 1
+    provider.expert_tensor_parallel_size = provider.tensor_model_parallel_size
     provider.expert_model_parallel_size = max(
         1, visible_gpu_count // provider.tensor_model_parallel_size
     )
@@ -296,10 +296,17 @@ def get_provider(
     provider.recompute_num_layers = 1
     provider.moe_shared_expert_overlap = True
     _apply_default_parallel_topology(provider)
+    _apply_runtime_env_overrides(provider)
+    flex_backend_found, _ = _env_optional_str(
+        "ART_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND"
+    )
     # use DeepEP for MoE expert comm. comm can be the same amount of time as actual MLP compute,
     # so these are very beneficial
     if _tp_ep_world_size(provider) > 1:
-        apply_flex_dispatcher_backend(provider, moe_flex_dispatcher_backend="deepep")
+        if not flex_backend_found:
+            apply_flex_dispatcher_backend(
+                provider, moe_flex_dispatcher_backend="deepep"
+            )
     else:
         provider.moe_shared_expert_overlap = False
     provider.moe_permute_fusion = True
@@ -309,7 +316,6 @@ def get_provider(
     provider.moe_aux_loss_coeff = 0.0
     # effectively just a flag modifying finalize_model_grads behavior for DPxCP
     provider.calculate_per_token_loss = True
-    _apply_runtime_env_overrides(provider)
     provider.sequence_parallel = provider.tensor_model_parallel_size > 1
     provider.finalize()
     return provider
