@@ -12,6 +12,18 @@ class OffloadState:
     is_offloaded: bool = False
 
 
+def _iter_megatron_param_buffers(model: Sequence[torch.nn.Module]) -> Iterator[Any]:
+    for chunk in model:
+        chunk_buffers = getattr(chunk, "buffers", None)
+        if callable(chunk_buffers):
+            raise RuntimeError("Megatron chunk is missing distributed param buffers")
+        if chunk_buffers is not None:
+            yield from chunk_buffers
+        expert_buffers = getattr(chunk, "expert_parallel_buffers", None)
+        if expert_buffers is not None:
+            yield from expert_buffers
+
+
 def _iter_megatron_optimizers(optimizer: Any) -> Iterator[Any]:
     chained_optimizers = getattr(optimizer, "chained_optimizers", None)
     if chained_optimizers is None:
@@ -42,33 +54,18 @@ def offload_to_cpu(
         return
     pinned_buffers = offload_state.pinned_buffers
 
-    for chunk in model:
-        for module in chunk.modules():
-            for attr in ["A_T", "B_T"]:
-                if not hasattr(module, attr):
-                    continue
-                param = getattr(module, attr)
-                if (
-                    not isinstance(param, torch.nn.Parameter)
-                    or param.device.type != "cuda"
-                ):
-                    continue
-                key = f"{id(module)}_{attr}"
-                if (
-                    key not in pinned_buffers
-                    or pinned_buffers[key].shape != param.shape
-                    or pinned_buffers[key].dtype != param.dtype
-                ):
-                    pinned_buffers[key] = torch.empty(
-                        param.shape, dtype=param.dtype, device="cpu", pin_memory=True
-                    )
-                pinned_buffers[key].copy_(param.data, non_blocking=True)
-                param.data = pinned_buffers[key]
+    for param_buffer in _iter_megatron_param_buffers(model):
+        param_buffer.offload_to_cpu(move_params=True, move_grads=True)
 
-    # Offload remaining model parameters (including base weights).
+    # Megatron remaps trainable params into contiguous DDP buffers. Offload those via the
+    # native buffer APIs above, and only manually offload frozen params here.
     for chunk in model:
         for param in chunk.parameters():
-            if not isinstance(param, torch.nn.Parameter) or param.device.type != "cuda":
+            if (
+                not isinstance(param, torch.nn.Parameter)
+                or param.requires_grad
+                or param.device.type != "cuda"
+            ):
                 continue
             key = f"param_{id(param)}"
             if (
@@ -82,20 +79,8 @@ def offload_to_cpu(
             pinned_buffers[key].copy_(param.data, non_blocking=True)
             param.data = pinned_buffers[key]
 
-    for param_id, opt_state in iter_optimizer_state_items(optimizer):
-        for k, v in opt_state.items():
-            if isinstance(v, torch.Tensor) and v.device.type == "cuda":
-                key = f"opt_{id(param_id)}_{k}"
-                if (
-                    key not in pinned_buffers
-                    or pinned_buffers[key].shape != v.shape
-                    or pinned_buffers[key].dtype != v.dtype
-                ):
-                    pinned_buffers[key] = torch.empty(
-                        v.shape, dtype=v.dtype, device="cpu", pin_memory=True
-                    )
-                pinned_buffers[key].copy_(v, non_blocking=True)
-                opt_state[k] = pinned_buffers[key]
+    for megatron_optimizer in _iter_megatron_optimizers(optimizer):
+        megatron_optimizer.offload_to_cpu()
 
     torch.cuda.synchronize()
     gc.collect()
@@ -121,36 +106,24 @@ def reload_to_gpu(
     else:
         device = torch.device(device)
 
-    for chunk in model:
-        for module in chunk.modules():
-            for attr in ["A_T", "B_T"]:
-                if not hasattr(module, attr):
-                    continue
-                param = getattr(module, attr)
-                if (
-                    not isinstance(param, torch.nn.Parameter)
-                    or param.device.type != "cpu"
-                ):
-                    continue
-                gpu_tensor = torch.empty(param.shape, dtype=param.dtype, device=device)
-                gpu_tensor.copy_(param.data, non_blocking=True)
-                param.data = gpu_tensor
+    for param_buffer in _iter_megatron_param_buffers(model):
+        param_buffer.reload_from_cpu(move_params=True, move_grads=True)
 
-    # Reload remaining model parameters (including base weights).
+    # Reload frozen params that were manually offloaded.
     for chunk in model:
         for param in chunk.parameters():
-            if not isinstance(param, torch.nn.Parameter) or param.device.type != "cpu":
+            if (
+                not isinstance(param, torch.nn.Parameter)
+                or param.requires_grad
+                or param.device.type != "cpu"
+            ):
                 continue
             gpu_tensor = torch.empty(param.shape, dtype=param.dtype, device=device)
             gpu_tensor.copy_(param.data, non_blocking=True)
             param.data = gpu_tensor
 
-    for _param_id, opt_state in iter_optimizer_state_items(optimizer):
-        for k, v in opt_state.items():
-            if isinstance(v, torch.Tensor) and v.device.type == "cpu":
-                gpu_tensor = torch.empty(v.shape, dtype=v.dtype, device=device)
-                gpu_tensor.copy_(v, non_blocking=True)
-                opt_state[k] = gpu_tensor
+    for megatron_optimizer in _iter_megatron_optimizers(optimizer):
+        megatron_optimizer.restore_from_cpu()
 
     torch.cuda.synchronize()
     offload_state.is_offloaded = False
