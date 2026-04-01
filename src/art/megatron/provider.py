@@ -150,6 +150,12 @@ def _apply_default_parallel_topology(provider: GPTModelProvider) -> None:
     provider.expert_tensor_parallel_size = 1
 
 
+def _tp_ep_parallel_domain_size(provider: GPTModelProvider) -> int:
+    return int(provider.tensor_model_parallel_size) * int(
+        provider.expert_model_parallel_size
+    )
+
+
 def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
     overlap = _env_flag("ART_MEGATRON_OVERLAP_MOE_EXPERT_PARALLEL_COMM")
     if overlap is not None:
@@ -285,9 +291,10 @@ def get_provider(
     provider.moe_shared_expert_overlap = True
     _apply_default_parallel_topology(provider)
     _apply_runtime_env_overrides(provider)
-    # use DeepEP for MoE expert comm. comm can be the same amount of time as actual MLP compute,
-    # so these are very beneficial
-    apply_flex_dispatcher_backend(provider, moe_flex_dispatcher_backend="deepep")
+    if _tp_ep_parallel_domain_size(provider) > 1:
+        # use DeepEP for MoE expert comm. comm can be the same amount of time as actual MLP
+        # compute, so these are very beneficial
+        apply_flex_dispatcher_backend(provider, moe_flex_dispatcher_backend="deepep")
     provider.moe_permute_fusion = True
     provider.moe_router_dtype = "fp32"
     # params are disabled anyways, but should know about this if we switch to full FT
