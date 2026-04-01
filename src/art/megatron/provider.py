@@ -143,26 +143,14 @@ def _resolve_default_deepep_num_sms(provider: GPTModelProvider) -> int:
 
 def _apply_default_parallel_topology(provider: GPTModelProvider) -> None:
     visible_gpu_count = max(torch.cuda.device_count(), 1)
-    provider.tensor_model_parallel_size = min(2, visible_gpu_count)
+    provider.tensor_model_parallel_size = visible_gpu_count
     provider.context_parallel_size = 1
     provider.pipeline_model_parallel_size = 1
-    provider.expert_tensor_parallel_size = provider.tensor_model_parallel_size
-    provider.expert_model_parallel_size = max(
-        1, visible_gpu_count // provider.tensor_model_parallel_size
-    )
-
-
-def _tp_ep_world_size(provider: GPTModelProvider) -> int:
-    return provider.tensor_model_parallel_size * provider.expert_model_parallel_size
+    provider.expert_model_parallel_size = visible_gpu_count
+    provider.expert_tensor_parallel_size = 1
 
 
 def _apply_runtime_env_overrides(provider: GPTModelProvider) -> None:
-    found, flex_backend = _env_optional_str("ART_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND")
-    if found and flex_backend is not None:
-        apply_flex_dispatcher_backend(
-            provider, moe_flex_dispatcher_backend=flex_backend
-        )
-
     overlap = _env_flag("ART_MEGATRON_OVERLAP_MOE_EXPERT_PARALLEL_COMM")
     if overlap is not None:
         provider.overlap_moe_expert_parallel_comm = overlap
@@ -297,18 +285,9 @@ def get_provider(
     provider.moe_shared_expert_overlap = True
     _apply_default_parallel_topology(provider)
     _apply_runtime_env_overrides(provider)
-    flex_backend_found, _ = _env_optional_str(
-        "ART_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND"
-    )
     # use DeepEP for MoE expert comm. comm can be the same amount of time as actual MLP compute,
     # so these are very beneficial
-    if _tp_ep_world_size(provider) > 1:
-        if not flex_backend_found:
-            apply_flex_dispatcher_backend(
-                provider, moe_flex_dispatcher_backend="deepep"
-            )
-    else:
-        provider.moe_shared_expert_overlap = False
+    apply_flex_dispatcher_backend(provider, moe_flex_dispatcher_backend="deepep")
     provider.moe_permute_fusion = True
     provider.moe_router_dtype = "fp32"
     # params are disabled anyways, but should know about this if we switch to full FT
