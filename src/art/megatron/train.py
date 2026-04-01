@@ -255,6 +255,22 @@ def _eager_initialize_optimizer_state(optimizer: Any) -> None:
         init_state_fn(inner_optimizer, getattr(optimizer, "config", None))
 
 
+def _layer_compile_enabled() -> bool:
+    return os.environ.get("ART_MEGATRON_COMPILE_TRANSFORMER_LAYERS", "1") not in {
+        "0",
+        "false",
+        "False",
+    }
+
+
+def _cpu_offload_enabled() -> bool:
+    return os.environ.get("ART_MEGATRON_ENABLE_CPU_OFFLOAD", "1") not in {
+        "0",
+        "false",
+        "False",
+    }
+
+
 def _install_gpt_preprocess_hook(model_chunks: ModelChunks) -> None:
     for chunk in model_chunks:
         module: Any = unwrap_megatron_chunk(chunk)
@@ -387,9 +403,10 @@ def build_training_runtime(
         print("TRITON_CACHE_DIR:", os.environ["TRITON_CACHE_DIR"])
 
     _install_gpt_preprocess_hook(model)
-    install_torch_compile_workarounds()
-    for chunk in model:
-        _compile_transformer_layers(chunk)
+    if _layer_compile_enabled():
+        install_torch_compile_workarounds()
+        for chunk in model:
+            _compile_transformer_layers(chunk)
 
     optimizer = get_megatron_optimizer(
         config=optimizer_config or _default_optimizer_config(),
@@ -612,6 +629,112 @@ def _count_trainable_tokens(inputs: PackedTensors) -> float:
     return float(assistant_mask.sum().item())
 
 
+def _debug_train_step_enabled() -> bool:
+    return os.environ.get("ART_MEGATRON_DEBUG_TRAIN_STEP", "0") in {"1", "true", "True"}
+
+
+def _iter_named_trainable_params(
+    model_chunks: ModelChunks,
+) -> list[tuple[str, torch.nn.Parameter]]:
+    seen: set[int] = set()
+    named_params: list[tuple[str, torch.nn.Parameter]] = []
+    for chunk_index, chunk in enumerate(model_chunks):
+        for name, param in chunk.named_parameters():
+            if not param.requires_grad:
+                continue
+            param_id = id(param)
+            if param_id in seen:
+                continue
+            seen.add(param_id)
+            named_params.append((f"chunk{chunk_index}.{name}", param))
+    return named_params
+
+
+def _capture_debug_param_snapshots(
+    model_chunks: ModelChunks,
+    *,
+    limit: int = 8,
+) -> list[tuple[str, torch.Tensor]]:
+    snapshots: list[tuple[str, torch.Tensor]] = []
+    for name, param in _iter_named_trainable_params(model_chunks)[:limit]:
+        snapshots.append((name, param.detach().clone()))
+    return snapshots
+
+
+def _summarize_trainable_grads(
+    model_chunks: ModelChunks,
+) -> dict[str, float | int | str]:
+    param_count = 0
+    nonzero_grad_count = 0
+    nonzero_main_grad_count = 0
+    max_abs_grad = 0.0
+    max_abs_main_grad = 0.0
+    max_abs_grad_name = ""
+    max_abs_main_grad_name = ""
+
+    for name, param in _iter_named_trainable_params(model_chunks):
+        param_count += 1
+        grad = param.grad
+        if isinstance(grad, torch.Tensor) and grad.numel() > 0:
+            grad_abs_max = float(grad.detach().abs().max().item())
+            if grad_abs_max > 0:
+                nonzero_grad_count += 1
+            if grad_abs_max > max_abs_grad:
+                max_abs_grad = grad_abs_max
+                max_abs_grad_name = name
+
+        main_grad = getattr(param, "main_grad", None)
+        if hasattr(main_grad, "_local_tensor"):
+            main_grad = main_grad._local_tensor
+        if isinstance(main_grad, torch.Tensor) and main_grad.numel() > 0:
+            main_grad_abs_max = float(main_grad.detach().abs().max().item())
+            if main_grad_abs_max > 0:
+                nonzero_main_grad_count += 1
+            if main_grad_abs_max > max_abs_main_grad:
+                max_abs_main_grad = main_grad_abs_max
+                max_abs_main_grad_name = name
+
+    return {
+        "trainable_param_count": param_count,
+        "nonzero_grad_param_count": nonzero_grad_count,
+        "nonzero_main_grad_param_count": nonzero_main_grad_count,
+        "max_abs_grad": max_abs_grad,
+        "max_abs_grad_name": max_abs_grad_name,
+        "max_abs_main_grad": max_abs_main_grad,
+        "max_abs_main_grad_name": max_abs_main_grad_name,
+    }
+
+
+def _summarize_param_snapshot_deltas(
+    model_chunks: ModelChunks,
+    snapshots: list[tuple[str, torch.Tensor]],
+) -> dict[str, float | int | str]:
+    current_by_name = {
+        name: param.detach()
+        for name, param in _iter_named_trainable_params(model_chunks)
+    }
+    changed_param_count = 0
+    max_abs_delta = 0.0
+    max_abs_delta_name = ""
+    for name, before in snapshots:
+        current = current_by_name.get(name)
+        if current is None:
+            continue
+        delta = (current - before).abs()
+        delta_max = float(delta.max().item()) if delta.numel() > 0 else 0.0
+        if delta_max > 0:
+            changed_param_count += 1
+        if delta_max > max_abs_delta:
+            max_abs_delta = delta_max
+            max_abs_delta_name = name
+    return {
+        "snapshot_param_count": len(snapshots),
+        "changed_snapshot_param_count": changed_param_count,
+        "max_abs_snapshot_delta": max_abs_delta,
+        "max_abs_snapshot_delta_name": max_abs_delta_name,
+    }
+
+
 def _local_trainable_token_count_tensor(
     micro_inputs: list[PackedTensors],
     device: torch.device,
@@ -656,13 +779,22 @@ def run_training_step(
         )
 
     device = next(model_chunks[0].parameters()).device
+    debug_snapshots = (
+        _capture_debug_param_snapshots(model_chunks)
+        if _debug_train_step_enabled()
+        else []
+    )
 
     for chunk in model_chunks:
         chunk.zero_grad_buffer()  # ty: ignore[call-non-callable]
 
     micro_count = len(micro_inputs)
     raw_loss_sum: torch.Tensor | None = None
-    num_tokens = _local_trainable_token_count_tensor(micro_inputs, device=device)
+    token_count = _local_trainable_token_count_tensor(micro_inputs, device=device)
+    normalize_by_trainable_tokens = os.environ.get(
+        "ART_MEGATRON_NORMALIZE_BY_TRAINABLE_TOKENS", "1"
+    ) not in {"0", "false", "False"}
+    num_tokens = token_count if normalize_by_trainable_tokens else None
     probs_corr_sum = 0.0
 
     for micro in micro_inputs:
@@ -711,11 +843,38 @@ def run_training_step(
         as_megatron_api_chunks(model_chunks),
         num_tokens=num_tokens,
     )
+    if _debug_train_step_enabled():
+        print(
+            "ART_MEGATRON_DEBUG_PRE_STEP",
+            json.dumps(
+                {
+                    "step_index": step_index,
+                    **_summarize_trainable_grads(model_chunks),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
     update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
         optimizer,
         learning_rate,
     )
-    global_num_tokens = max(num_tokens.item(), 1.0)
+    if _debug_train_step_enabled():
+        print(
+            "ART_MEGATRON_DEBUG_POST_STEP",
+            json.dumps(
+                {
+                    "step_index": step_index,
+                    "update_successful": update_successful,
+                    "grad_norm": grad_norm,
+                    "num_zeros_in_grad": num_zeros_in_grad,
+                    **_summarize_param_snapshot_deltas(model_chunks, debug_snapshots),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+    global_num_tokens = max(token_count.item(), 1.0)
     reduced_loss = _reduce_loss(
         raw_loss_sum / global_num_tokens,
         op=torch.distributed.ReduceOp.SUM,  # ty: ignore[possibly-missing-attribute]
@@ -736,7 +895,8 @@ def run_training_step(
 
 def _run_service_loop(runtime: TrainingRuntime) -> None:
     offload_state = OffloadState()
-    offload_to_cpu(runtime.model, runtime.optimizer, runtime.rank, offload_state)
+    if _cpu_offload_enabled():
+        offload_to_cpu(runtime.model, runtime.optimizer, runtime.rank, offload_state)
     jobs_dir = os.environ.get("ART_MEGATRON_JOBS_DIR", "/tmp/megatron_training_jobs")
     training_log_path = os.environ.get(
         "ART_MEGATRON_TRAINING_LOG_PATH", "/tmp/megatron_training_log.jsonl"
@@ -759,7 +919,8 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         while os.path.exists(wake_lock_path):
             time.sleep(0.2)
 
-        reload_to_gpu(runtime.model, runtime.optimizer, runtime.rank, offload_state)
+        if _cpu_offload_enabled():
+            reload_to_gpu(runtime.model, runtime.optimizer, runtime.rank, offload_state)
 
         job_name = job_names[0]
         job_path = os.path.join(jobs_dir, job_name)
@@ -874,7 +1035,10 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         os.makedirs(job.optimizer_state_path, exist_ok=True)
         torch.save(runtime.optimizer.state_dict(), optimizer_shard_path)
 
-        offload_to_cpu(runtime.model, runtime.optimizer, runtime.rank, offload_state)
+        if _cpu_offload_enabled():
+            offload_to_cpu(
+                runtime.model, runtime.optimizer, runtime.rank, offload_state
+            )
 
         del packed_tensors
         del template
