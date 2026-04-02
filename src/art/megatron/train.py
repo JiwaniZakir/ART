@@ -16,10 +16,10 @@ _set_cache_dir("TRITON_CACHE_DIR", "~/.triton/cache")
 # isort: on
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import gc
 import json
 import math
-import re
 import shutil
 import time
 from typing import Any, Callable, cast
@@ -29,28 +29,25 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.transformer_layer import TransformerLayer
 from pydantic import BaseModel, ConfigDict
 from safetensors.torch import load_file, save_file
 import torch
+from torch.distributed import all_reduce
 from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_dir
 
 from art import dev, types
 from art.loss import loss_fn, shift_tensor
+from art.megatron.bridge_adapter_compat import build_adapter_weights_by_base
 from art.megatron.finalize_grads import finalize_model_grads_extended
 from art.megatron.flex_attention import create_shared_prefix_attention_state
 from art.megatron.job_protocol import (
     MegatronMergedTrainJob,
+    MegatronSyncJob,
     MergedWeightTransferInitInfo,
     MergedWeightTransferSpec,
     load_megatron_job,
 )
 from art.megatron.lora import (
-    LoRA,
-    MLPExpertsLinearFC1LoRA,
-    MLPExpertsLinearFC2LoRA,
-    SelfAttentionLinearProjLoRA,
-    SelfAttentionLinearQKVLoRA,
     apply_lora_adapters,
 )
 from art.megatron.offload import (
@@ -59,7 +56,7 @@ from art.megatron.offload import (
     offload_to_cpu,
     reload_to_gpu,
 )
-from art.megatron.provider import get_provider
+from art.megatron.provider import get_provider_bundle
 from art.megatron.routing_replay import (
     MoeRoutingReplayBundle,
     MoeRoutingReplayController,
@@ -77,6 +74,7 @@ class TrainingRuntime(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     provider: Any
+    bridge: Any
     model: list[MegatronModule]
     optimizer: Any
     rank: int
@@ -95,6 +93,15 @@ class TrainStepResult(BaseModel):
     update_successful: bool
     grad_norm: float
     num_zeros_in_grad: int | None
+
+
+@dataclass
+class MergedWeightExport:
+    bridge: Any
+    model: list[MegatronModule]
+    model_config: Any
+    conversion_tasks: list[Any]
+    adapter_weights_by_base: dict[str, list[Any]]
 
 
 def print0(rank: int, *values: Any) -> None:
@@ -136,7 +143,7 @@ def _install_fast_frozen_output_backward() -> None:
         (weight,) = ctx.saved_tensors
         grad_input = _frozen_linear_grad_input(grad_output, weight)
         if ctx.allreduce_dgrad:
-            torch.distributed.all_reduce(grad_input, group=ctx.tp_group)
+            all_reduce(grad_input, group=ctx.tp_group)
         return grad_input, None, None, None, None
 
     setattr(_fast_backward, "__art_fast_output_backward__", True)
@@ -149,6 +156,8 @@ def _install_gpt_preprocess_hook(model_chunks: list[MegatronModule]) -> None:
         while not isinstance(module, GPTModel) and hasattr(module, "module"):
             module = module.module
         if not isinstance(module, GPTModel):
+            module = getattr(module, "language_model", None)
+        if not isinstance(module, GPTModel):
             continue
         preprocess = module._preprocess
 
@@ -159,6 +168,8 @@ def _install_gpt_preprocess_hook(model_chunks: list[MegatronModule]) -> None:
             embedding_dim = table.size(-1)
             table_flat = table.view(table.size(0), embedding_dim)
             position_ids = kwargs["position_ids"]  # [B, S]
+            if position_ids.ndim != 2:
+                return tuple(preproc_output)
             batch_size, sequence_length = position_ids.shape
             gathered = table_flat.index_select(0, position_ids.reshape(-1))
             gathered = (
@@ -230,11 +241,12 @@ def build_training_runtime(
     print_optimizer_stats: bool = True,
 ) -> TrainingRuntime:
     _install_fast_frozen_output_backward()
-    provider = get_provider(
+    provider_bundle = get_provider_bundle(
         model_identifier
         or os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
         torch_dtype=provider_torch_dtype,
     )
+    provider = provider_bundle.provider
     if provider_configure is not None:
         provider_configure(provider)
     provider.register_pre_wrap_hook(freeze_model)
@@ -287,6 +299,7 @@ def build_training_runtime(
 
     runtime = TrainingRuntime(
         provider=provider,
+        bridge=provider_bundle.bridge,
         model=model,
         optimizer=optimizer,
         rank=rank,
@@ -305,18 +318,6 @@ def iter_modules(model_chunks: list[MegatronModule]) -> Any:
     for chunk in model_chunks:
         for module in chunk.modules():
             yield module
-
-
-def iter_named_modules(model_chunks: list[MegatronModule]) -> Any:
-    for chunk in model_chunks:
-        for module_name, module in chunk.named_modules():
-            yield module_name, module
-
-
-def _is_language_transformer_layer_name(module_name: str) -> bool:
-    while module_name.startswith("module."):
-        module_name = module_name.removeprefix("module.")
-    return module_name.startswith(("decoder.layers.", "language_model.decoder.layers."))
 
 
 def load_adapter_into_model(
@@ -465,6 +466,18 @@ def _move_inputs_to_device(inputs: PackedTensors, device: torch.device) -> None:
             inputs[key] = value.to(device)  # type: ignore[index]
 
 
+def _attention_block_kwargs(
+    model_chunk: MegatronModule,
+    attention_state: Any,
+) -> dict[str, Any]:
+    model = model_chunk
+    while hasattr(model, "module"):
+        model = model.module  # type: ignore[assignment]
+    if type(model).__name__ == "Qwen3VLModel":
+        return {"extra_block_kwargs": {"attention_bias": attention_state}}
+    return {"attention_bias": attention_state}
+
+
 def _optimizer_step(
     optimizer: Any,
     learning_rate: float,
@@ -559,13 +572,17 @@ def run_training_step(
         )
         attention_mask = torch.zeros((1, 1, 1, 1), dtype=torch.bool, device=device)
 
-        new_logprobs = -model_chunks[0](
+        model_output = model_chunks[0](
             input_ids=micro["tokens"],
             position_ids=micro["input_pos"],
             attention_mask=attention_mask,
             labels=shift_tensor(micro["tokens"], 0),
-            extra_block_kwargs={"attention_bias": attention_state},
+            extra_block_kwargs=_attention_block_kwargs(
+                model_chunks[0],
+                attention_state,
+            ),
         )
+        new_logprobs = -model_output
 
         loss_info = loss_fn(
             micro,  # ty: ignore[invalid-argument-type]
@@ -620,23 +637,44 @@ def _is_art_adapter_param_name(name: str) -> bool:
             ".q_proj_lora.",
             ".k_proj_lora.",
             ".v_proj_lora.",
+            ".qkv_lora.",
+            ".z_lora.",
             ".gate_lora.",
             ".up_lora.",
         )
     )
 
 
-def _unwrap_art_wrapper_name(name: str) -> str:
-    while name.startswith("module."):
-        name = name[len("module.") :]
-    for wrapped, unwrapped in (
-        (".linear_proj.linear_proj.", ".linear_proj."),
-        (".linear_qkv.linear_qkv.", ".linear_qkv."),
-        (".linear_fc1.linear_fc1.", ".linear_fc1."),
-        (".linear_fc2.linear_fc2.", ".linear_fc2."),
-    ):
-        name = name.replace(wrapped, unwrapped)
-    return name
+def _canonical_art_param_name(name: str) -> str:
+    segments = name.split(".")
+    while segments and segments[0] == "module":
+        segments = segments[1:]
+    canonical: list[str] = []
+    i = 0
+    while i < len(segments):
+        if i + 1 < len(segments):
+            current = segments[i]
+            nxt = segments[i + 1]
+            if current in {
+                "linear_proj",
+                "linear_qkv",
+                "in_proj",
+                "linear_fc1",
+                "linear_fc2",
+            } and nxt == current:
+                canonical.append(current)
+                i += 2
+                continue
+            if current == "out_proj" and nxt == "linear_proj":
+                canonical.append(current)
+                i += 2
+                continue
+            if current == "row_parallel_lora" and nxt == "linear_proj":
+                i += 2
+                continue
+        canonical.append(segments[i])
+        i += 1
+    return ".".join(canonical)
 
 
 def _mapping_hf_weights_exist(mapping: Any, hf_keys: set[str]) -> bool:
@@ -645,178 +683,9 @@ def _mapping_hf_weights_exist(mapping: Any, hf_keys: set[str]) -> bool:
     hf_param = mapping.hf_param
     if isinstance(hf_param, str):
         return hf_param in hf_keys
-    assert isinstance(hf_param, dict)
-    return all(param in hf_keys for param in hf_param.values())
-
-
-def _lora_delta(lora: LoRA, expert_idx: int | None = None) -> torch.Tensor:
-    if lora.A_T.ndim == 3:
-        assert expert_idx is not None
-        a_t = lora.A_T[expert_idx]
-        b_t = lora.B_T[expert_idx]
-    else:
-        a_t = lora.A_T
-        b_t = lora.B_T
-    return (b_t.T @ a_t.T) * lora.scale
-
-
-def _expert_index_from_hf_name(hf_name: str) -> int:
-    match = re.search(r"\.experts\.(\d+)\.", hf_name)
-    assert match is not None
-    return int(match.group(1))
-
-
-def _hf_name_has_indexed_expert(hf_name: str) -> bool:
-    return re.search(r"\.experts\.(\d+)\.", hf_name) is not None
-
-
-def _stack_moe_fc1_deltas(handler: MLPExpertsLinearFC1LoRA) -> torch.Tensor:
-    return torch.stack(
-        [
-            torch.cat(
-                [
-                    _lora_delta(handler.gate_lora, expert_idx),
-                    _lora_delta(handler.up_lora, expert_idx),
-                ],
-                dim=0,
-            )
-            for expert_idx in range(handler.gate_lora.num_local_experts)
-        ],
-        dim=0,
-    )
-
-
-def _stack_moe_fc2_deltas(handler: MLPExpertsLinearFC2LoRA) -> torch.Tensor:
-    return torch.stack(
-        [
-            _lora_delta(handler.lora, expert_idx)
-            for expert_idx in range(handler.lora.num_local_experts)
-        ],
-        dim=0,
-    )
-
-
-def _merge_delta_into_weight(
-    hf_name: str,
-    base_weight: torch.Tensor,
-    delta: torch.Tensor,
-) -> torch.Tensor:
-    delta = delta.to(device=base_weight.device, dtype=base_weight.dtype)
-    if tuple(base_weight.shape) == tuple(delta.shape):
-        return base_weight + delta
-    transposed = delta.transpose(-1, -2)
-    assert tuple(base_weight.shape) == tuple(transposed.shape), (
-        f"{hf_name}: cannot merge delta {tuple(delta.shape)} into {tuple(base_weight.shape)}"
-    )
-    return base_weight + transposed
-
-
-def _build_art_merge_handlers(
-    model_chunks: list[MegatronModule],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    exact_handlers: dict[str, Any] = {}
-    prefix_handlers: dict[str, Any] = {}
-    for module_name, module in iter_named_modules(model_chunks):
-        if not isinstance(module, TransformerLayer):
-            continue
-        if not _is_language_transformer_layer_name(module_name):
-            continue
-        prefix = f"language_model.decoder.layers.{module.layer_number - 1}"
-        linear_proj = getattr(module.self_attention, "linear_proj", None)
-        if isinstance(linear_proj, SelfAttentionLinearProjLoRA):
-            exact_handlers[f"{prefix}.self_attention.linear_proj.weight"] = linear_proj
-        linear_qkv = getattr(module.self_attention, "linear_qkv", None)
-        if isinstance(linear_qkv, SelfAttentionLinearQKVLoRA):
-            exact_handlers[f"{prefix}.self_attention.linear_qkv.weight"] = linear_qkv
-        experts = getattr(module.mlp, "experts", None)
-        if experts is None:
-            continue
-        if isinstance(experts.linear_fc1, MLPExpertsLinearFC1LoRA):
-            prefix_handlers[f"{prefix}.mlp.experts.linear_fc1.weight"] = (
-                experts.linear_fc1
-            )
-        if isinstance(experts.linear_fc2, MLPExpertsLinearFC2LoRA):
-            prefix_handlers[f"{prefix}.mlp.experts.linear_fc2.weight"] = (
-                experts.linear_fc2
-            )
-    return exact_handlers, prefix_handlers
-
-
-def _merge_art_lora_into_hf_weights(
-    global_param_name: str,
-    converted_weights_dict: dict[str, torch.Tensor],
-    *,
-    exact_handlers: dict[str, Any],
-    prefix_handlers: dict[str, Any],
-) -> dict[str, torch.Tensor]:
-    handler = exact_handlers.get(global_param_name)
-    if handler is None:
-        for prefix, prefix_handler in prefix_handlers.items():
-            if global_param_name.startswith(prefix):
-                handler = prefix_handler
-                break
-    if handler is None:
-        return converted_weights_dict
-    if isinstance(handler, SelfAttentionLinearProjLoRA):
-        hf_name, base_weight = next(iter(converted_weights_dict.items()))
-        converted_weights_dict[hf_name] = _merge_delta_into_weight(
-            hf_name,
-            base_weight,
-            _lora_delta(handler.lora),
-        )
-        return converted_weights_dict
-    if isinstance(handler, SelfAttentionLinearQKVLoRA):
-        deltas = {
-            "q_proj": _lora_delta(handler.q_proj_lora),
-            "k_proj": _lora_delta(handler.k_proj_lora),
-            "v_proj": _lora_delta(handler.v_proj_lora),
-        }
-        for hf_name, base_weight in list(converted_weights_dict.items()):
-            for projection, delta in deltas.items():
-                if projection in hf_name:
-                    converted_weights_dict[hf_name] = _merge_delta_into_weight(
-                        hf_name,
-                        base_weight,
-                        delta,
-                    )
-                    break
-        return converted_weights_dict
-    if isinstance(handler, MLPExpertsLinearFC1LoRA):
-        for hf_name, base_weight in list(converted_weights_dict.items()):
-            delta = (
-                torch.cat(
-                    [
-                        _lora_delta(
-                            handler.gate_lora, _expert_index_from_hf_name(hf_name)
-                        ),
-                        _lora_delta(
-                            handler.up_lora, _expert_index_from_hf_name(hf_name)
-                        ),
-                    ],
-                    dim=0,
-                )
-                if _hf_name_has_indexed_expert(hf_name)
-                else _stack_moe_fc1_deltas(handler)
-            )
-            converted_weights_dict[hf_name] = _merge_delta_into_weight(
-                hf_name,
-                base_weight,
-                delta,
-            )
-        return converted_weights_dict
-    assert isinstance(handler, MLPExpertsLinearFC2LoRA)
-    for hf_name, base_weight in list(converted_weights_dict.items()):
-        delta = (
-            _lora_delta(handler.lora, _expert_index_from_hf_name(hf_name))
-            if _hf_name_has_indexed_expert(hf_name)
-            else _stack_moe_fc2_deltas(handler)
-        )
-        converted_weights_dict[hf_name] = _merge_delta_into_weight(
-            hf_name,
-            base_weight,
-            delta,
-        )
-    return converted_weights_dict
+    if isinstance(hf_param, dict):
+        return all(param in hf_keys for param in hf_param.values())
+    return False
 
 
 def _build_art_conversion_tasks(runtime: TrainingRuntime) -> list[Any]:
@@ -831,8 +700,7 @@ def _build_art_conversion_tasks(runtime: TrainingRuntime) -> list[Any]:
         persistent_buffers,
     )
 
-    bridge = getattr(runtime.provider, "art_bridge", None)
-    assert bridge is not None
+    bridge = runtime.bridge
     mapping_registry = bridge._model_bridge.mapping_registry()
     hf_source = bridge.hf_pretrained.state.source
     hf_keys = set(hf_source.get_all_keys())
@@ -845,7 +713,7 @@ def _build_art_conversion_tasks(runtime: TrainingRuntime) -> list[Any]:
             global_name = _megatron_local_name_to_global(
                 runtime.model,
                 model_config,
-                _unwrap_art_wrapper_name(local_name),
+                _canonical_art_param_name(local_name),
                 vp_stage,
             )
             mapping = mapping_registry.megatron_to_hf_lookup(global_name)
@@ -872,30 +740,52 @@ def _build_art_conversion_tasks(runtime: TrainingRuntime) -> list[Any]:
     return tasks
 
 
-def _iter_merged_vllm_weights(runtime: TrainingRuntime) -> Any:
+def _build_merged_weight_export(runtime: TrainingRuntime) -> MergedWeightExport:
+    return MergedWeightExport(
+        bridge=runtime.bridge,
+        model=runtime.model,
+        model_config=runtime.model[0].config,
+        conversion_tasks=_build_art_conversion_tasks(runtime),
+        adapter_weights_by_base=build_adapter_weights_by_base(runtime.model),
+    )
+
+
+def _iter_merged_vllm_weights(weight_export: MergedWeightExport) -> Any:
     # vLLM expects HF checkpoint names, but Megatron only has live trainer weights.
     # Convert through Bridge here, then merge ART's LoRA deltas into those tensors.
-    bridge = getattr(runtime.provider, "art_bridge", None)
-    assert bridge is not None
+    bridge = weight_export.bridge
     model_bridge = bridge._model_bridge
     hf_state_dict = bridge.hf_pretrained.state
-    exact_handlers, prefix_handlers = _build_art_merge_handlers(runtime.model)
-    for task in _build_art_conversion_tasks(runtime):
+    grouped_buffers: dict[str, dict[int, torch.Tensor]] = {}
+    for task in weight_export.conversion_tasks:
         converted_weights_dict = task.mapping.megatron_to_hf(
             task.param_weight,
             task.megatron_module,
         )
-        converted_weights_dict = model_bridge.maybe_modify_converted_hf_weight(
-            task,
-            converted_weights_dict,
-            hf_state_dict,
-        )
-        converted_weights_dict = _merge_art_lora_into_hf_weights(
-            task.global_param_name,
-            converted_weights_dict,
-            exact_handlers=exact_handlers,
-            prefix_handlers=prefix_handlers,
-        )
+        adapter_weights = weight_export.adapter_weights_by_base.get(task.global_param_name)
+        if adapter_weights is not None:
+            converted_weights_dict = model_bridge._merge_lora_adapter_weights(
+                weight_export.model,
+                converted_weights_dict,
+                adapter_weights,
+            )
+        if getattr(task.mapping, "is_grouped_export", False):
+            merged_result = model_bridge._accumulate_grouped_export(
+                task,
+                converted_weights_dict,
+                weight_export.model_config,
+                grouped_buffers,
+                hf_state_dict,
+            )
+            if merged_result is None:
+                continue
+            converted_weights_dict = merged_result
+        else:
+            converted_weights_dict = model_bridge.maybe_modify_converted_hf_weight(
+                task,
+                converted_weights_dict,
+                hf_state_dict,
+            )
         for hf_name, tensor in converted_weights_dict.items():
             yield hf_name, tensor
 
@@ -947,10 +837,11 @@ def _sync_merged_weights_to_vllm(
     from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
 
     _ensure_merged_weight_transfer_group(runtime, spec)
+    weight_export = _build_merged_weight_export(runtime)
 
     def _send_weights() -> None:
         NCCLWeightTransferEngine.trainer_send_weights(
-            _iter_merged_vllm_weights(runtime),
+            _iter_merged_vllm_weights(weight_export),
             {"group": runtime.merged_weight_transfer_group},
         )
 
@@ -967,7 +858,7 @@ def _sync_merged_weights_to_vllm(
             names: list[str] = []
             dtype_names: list[str] = []
             shapes: list[list[int]] = []
-            for name, tensor in _iter_merged_vllm_weights(runtime):
+            for name, tensor in _iter_merged_vllm_weights(weight_export):
                 names.append(name)
                 dtype_names.append(str(tensor.dtype).removeprefix("torch."))
                 shapes.append(list(tensor.shape))
@@ -1028,13 +919,14 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         job_path = os.path.join(jobs_dir, job_name)
         with open(job_path, "rb") as handle:
             job = load_megatron_job(handle.read())
-        if job.kind != "sync":
-            config = job.config
-            experimental_config = job.experimental_config
+        train_job = None if isinstance(job, MegatronSyncJob) else job
+        if train_job is not None:
+            config = train_job.config
+            experimental_config = train_job.experimental_config
             configure_moe_routing_replay(
                 runtime,
-                replay_bundle_path=job.moe_routing_replay_path,
-                strict=job.moe_routing_replay_strict,
+                replay_bundle_path=train_job.moe_routing_replay_path,
+                strict=train_job.moe_routing_replay_strict,
             )
 
         print0(runtime.rank, "Loaded job from", job_path)
@@ -1048,15 +940,16 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
             rank=runtime.rank,
         )
 
-        if job.kind == "sync":
+        if isinstance(job, MegatronSyncJob):
             _sync_merged_weights_to_vllm(
                 runtime,
                 job.merged_weight_transfer,
                 pause_generation=False,
             )
         else:
+            assert train_job is not None
             optimizer_shard_path = os.path.join(
-                job.optimizer_state_path,
+                train_job.optimizer_state_path,
                 f"{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.pt",
             )
             if os.path.exists(optimizer_shard_path):
@@ -1074,12 +967,12 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
             print0(
                 runtime.rank,
                 "Loading packed tensors from",
-                job.disk_packed_tensors["dir"],
+                train_job.disk_packed_tensors["dir"],
             )
-            packed_tensors = packed_tensors_from_dir(**job.disk_packed_tensors)
+            packed_tensors = packed_tensors_from_dir(**train_job.disk_packed_tensors)
             template = _clone_packed_tensors(select_indexed_inputs(packed_tensors, 0))
             zero_template = _zero_contribution_inputs(template)
-            num_sequences = job.disk_packed_tensors["num_sequences"]
+            num_sequences = train_job.disk_packed_tensors["num_sequences"]
             global_grad_accumulation_sequences = config.grad_accumulation_sequences
             num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
             for step_index in range(num_steps):
@@ -1142,19 +1035,19 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
                 json.dump(sharded_state_manifest, manifest_file, sort_keys=True)
 
             print("Saving optimizer shard to", optimizer_shard_path)
-            os.makedirs(job.optimizer_state_path, exist_ok=True)
+            os.makedirs(train_job.optimizer_state_path, exist_ok=True)
             torch.save(runtime.optimizer.state_dict(), optimizer_shard_path)
 
-            if isinstance(job, MegatronMergedTrainJob):
+            if isinstance(train_job, MegatronMergedTrainJob):
                 _sync_merged_weights_to_vllm(
                     runtime,
-                    job.merged_weight_transfer,
+                    train_job.merged_weight_transfer,
                     pause_generation=True,
                 )
 
         offload_to_cpu(runtime.model, runtime.optimizer, runtime.rank, offload_state)
 
-        if job.kind != "sync":
+        if train_job is not None:
             del packed_tensors
             del template
             del zero_template
@@ -1171,8 +1064,8 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
                 "/tmp/megatron_training_log.jsonl", "a+", encoding="utf-8"
             ) as log_file:
                 log_file.write("all done\n")
-            if job.kind != "sync":
-                shutil.rmtree(job.disk_packed_tensors["dir"])
+            if train_job is not None:
+                shutil.rmtree(train_job.disk_packed_tensors["dir"])
 
 
 def main() -> None:
